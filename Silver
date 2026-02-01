@@ -1,0 +1,955 @@
+# Databricks notebook source
+# MAGIC %md
+# MAGIC # 00 Config
+
+# COMMAND ----------
+
+import sys
+import time
+from time import sleep
+import datetime
+import splunklib.client as client
+#from utils import parse
+from datetime import timedelta
+import splunklib.results as results
+import pandas as pd
+from io import BytesIO
+import sqlalchemy as sa
+import urllib
+from dateutil import parser
+from functools import reduce
+import os
+import snowflake.connector as snow
+import pyodbc
+from openpyxl import load_workbook
+from snowflake.connector.pandas_tools import write_pandas
+import numpy as np
+from office365.runtime.auth.authentication_context import AuthenticationContext
+from office365.sharepoint.client_context import ClientContext
+from office365.runtime.auth.client_credential import ClientCredential
+from office365.sharepoint.files.file import File
+from pyspark.sql import functions as F
+from pyspark.sql.functions import lit
+from datetime import datetime
+import io
+from datetime import date
+from urllib.parse import quote
+import snowflake.connector 
+import base64 
+import random 
+import json 
+import ssl 
+from urllib.parse import urlparse, urlunparse, urlencode, quote 
+from tabulate import tabulate 
+import requests
+import string
+
+snflk_refresh_token = dbutils.secrets.get(
+    scope="azure_key_vault_backed_databricks_scope",
+    key="RSC-PRD-SNF-PBOARD-DI-RefreshToken",
+)
+
+
+snflk_client_secret = dbutils.secrets.get(
+    scope="azure_key_vault_backed_databricks_scope",
+    key="Snowflake-PI-Client-Secret",
+)
+
+snflk_client_id = dbutils.secrets.get(
+    scope="azure_key_vault_backed_databricks_scope",
+    key="Snowflake-PI-Client-Id",
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC # 01 - Load from Snowflake
+
+# COMMAND ----------
+
+BRONZE_TABLE = "BDM_PPDA_DB.PROD_BOARD_T.TSENTIMENT_SPRINKLR_BRONZE"
+SILVER_TABLE = "BDM_PPDA_DB.PROD_BOARD_T.TSENTIMENT_SPRINKLR_SILVER"
+# -------------------------
+# Snowflake OAuth (expects workspace secrets/vars: snflk_client_id, snflk_client_secret, snflk_refresh_token)
+# -------------------------
+client_id = snflk_client_id
+client_secret = snflk_client_secret
+redirect_uri = 'https://localhost.com'
+token_endpoint = 'https://tmobile.west-us-2.privatelink.snowflakecomputing.com/oauth/token-request'
+refresh_token = snflk_refresh_token
+
+hdrs = {
+    'Authorization': 'Basic {}'.format(
+        base64.b64encode(f'{client_id}:{client_secret}'.encode()).decode()
+    ),
+    'Content-type': 'application/x-www-form-urlencoded;charset=utf-8'
+}
+data = urlencode({
+    'grant_type': 'refresh_token',
+    'refresh_token': refresh_token,
+    'redirect_uri': redirect_uri
+}).encode('ascii')
+
+r = requests.post(token_endpoint, headers=hdrs, data=data)
+r.raise_for_status()
+access_token = r.json()['access_token']
+
+ctx = snowflake.connector.connect(
+    user="RSC_PRD_SF_PBOARD_DI@T-MOBILE.COM",
+    account='tmobile.west-us-2.privatelink',
+    authenticator='oauth',
+    warehouse='BDM_PPDA_DI_PRD_WH_01',
+    database='BDM_PPDA_DB',
+    schema='PROD_BOARD_T',
+    token=access_token
+)
+cur = ctx.cursor()
+
+# -------------------------
+# Incremental fetch: Bronze rows whose ID is NOT present in Silver (anti-join)
+# - Compare as STRING to avoid numeric/string mismatches
+# - Skips NULL/empty IDs and hash rows (removed due to resyndication policies) from Bronze
+# -------------------------
+query = f"""
+WITH bronze_base AS (
+  SELECT DISTINCT
+      ID::STRING                    AS BRONZE_ID,
+      UNIVERSAL_MESSAGE_ID::STRING  AS UMID, 
+      MESSAGE_CONTENT::STRING       AS MESSAGE_CONTENT,
+      PLATFORM::STRING              AS PLATFORM,
+      LOAD_DATE::DATE               AS LOAD_DATE
+  FROM {BRONZE_TABLE}
+  WHERE ID IS NOT NULL
+    AND ID::STRING <> ''
+    AND MESSAGE_CONTENT NOT RLIKE '^[0-9A-Fa-f]{32,64}$'
+    --AND SN_CREATED_TIME_PST = '2025-10-28'
+),
+silver_umids AS (
+  SELECT DISTINCT b.UMID
+  FROM {SILVER_TABLE} s
+  JOIN bronze_base b
+    ON b.BRONZE_ID = s.BRONZE_ID::STRING
+),
+dedup_bronze AS (
+  SELECT *
+  FROM (
+    SELECT
+      b.*,
+      ROW_NUMBER() OVER (
+        PARTITION BY b.UMID
+        ORDER BY b.LOAD_DATE DESC, b.BRONZE_ID DESC
+      ) AS rn
+    FROM bronze_base b
+  )
+  WHERE rn = 1
+)
+SELECT TOP 1750
+  d.BRONZE_ID,
+  d.UMID AS UNIVERSAL_MESSAGE_ID,
+  d.MESSAGE_CONTENT,
+  d.PLATFORM
+FROM dedup_bronze d
+LEFT JOIN silver_umids s
+  ON d.UMID = s.UMID
+WHERE s.UMID IS NULL
+AND d.MESSAGE_CONTENT NOT RLIKE '^[0-9A-Fa-f]{32,64}$'
+AND MESSAGE_CONTENT IS NOT NULL
+AND TRIM(MESSAGE_CONTENT) <> ''
+AND MESSAGE_CONTENT NOT RLIKE '[A-Za-z0-9]'
+ORDER BY d.LOAD_DATE DESC;
+"""
+
+cur.execute(query)
+df_pd = cur.fetch_pandas_all()
+
+query_topics = f"""
+SELECT * FROM BDM_PPDA_DB.PROD_BOARD_T.EXEC_DASHBOARD_CATEGORIZATION
+"""
+cur.execute(query_topics)
+topics_df_pd = cur.fetch_pandas_all()
+
+print(f"Fetched {len(df_pd.index)} rows from {BRONZE_TABLE}.")
+
+# COMMAND ----------
+
+#topics_df_pd
+
+# COMMAND ----------
+
+#df_pd
+
+# COMMAND ----------
+
+# =========================
+# Helper functions for process below
+# =========================
+import os, time, json, uuid, hashlib, re
+from datetime import datetime, timezone
+import pandas as pd
+import requests
+from typing import Optional
+
+def normalize_text(s: str) -> str:
+    s = re.sub(r"\s+", " ", s or "").strip()
+    return s
+
+def content_hash(text: str, prompt_version: str) -> str:
+    return hashlib.sha256((normalize_text(text) + "|" + prompt_version).encode("utf-8")).hexdigest()
+
+def chunk(seq, n):
+    for i in range(0, len(seq), n):
+        yield seq[i:i+n]
+
+class SimpleRateLimiter:
+    """Very small in-memory sliding window limiter for RPM."""
+    def __init__(self, rpm: int, window_sec: int = 60):
+        self.rpm = rpm
+        self.window = window_sec
+        self.calls = []
+    def acquire(self):
+        now = time.time()
+        self.calls = [t for t in self.calls if now - t < self.window]
+        if len(self.calls) >= self.rpm:
+            sleep_for = self.window - (now - self.calls[0]) + 0.05
+            time.sleep(max(0, sleep_for))
+        self.calls.append(time.time())
+
+JSON_START_TAG = "<json>"
+JSON_END_TAG = "</json>"
+
+SYSTEM_PROMPT = (
+    "You are a precise social listening analyst.Your task is to assign each social media post to the most relevant topic, please consider all topics before assigning post.The selected topic should be specific enough to guide accurate tagging.\n"
+    f"Return ONLY a MINIFIED JSON array wrapped between {JSON_START_TAG} and {JSON_END_TAG}. "
+    "No text outside the tags. No code fences. No pretty-printing.\n\n"
+    "For each post:\n"
+    "1) summary: ≤160 words on how/why it's relevant to T-Mobile, AT&T, or Verizon (concise).\n"
+    "2) pillar: one of 'Best Experience','Best Value','Best Network', 'Worse Experience', 'Worst Value', 'Worst Network'.\n"
+    "3) sentiment_label: 'positive'|'negative'|'neutral'.\n"
+    "4) topics: 0–4 from ALLOWED_TOPICS; use 'Other' if none fit.\n"
+    "5) llm_topics: Using 3 to 5 words, create a descriptive free-form topic label.\n"
+    "6) entities: optional list.\n\n"
+    "Output item schema inside the array:\n"
+    "[{\"id\":\"<BRONZE_ID>\",\"summary\":\"...\",\"pillar\":\"Best Value\",\"sentiment_label\":\"neutral\","
+    "\"topics\":[\"...\"],\"llm_topics\":[\"...\"],\"entities\":[\"...\"],\"confidence\":0.0}]\n"
+    "Rules:\n"
+    f"- Wrap the array strictly between {JSON_START_TAG} and {JSON_END_TAG}.\n"
+    "- Keep strings brief; avoid repetition; no markdown.\n"
+)
+
+def build_user_payload(items):
+    # items: list[{id,text,platform}]
+    return {
+        "allowed_topics": TMOBILE_TOPICS,
+        "pillar_labels": PILLAR_LABELS,
+        "sentiment_labels": SENTIMENT_LABELS,
+        "items": [{"id": it["id"], "text": it["text"], "platform": it.get("platform")} for it in items]
+    }
+
+def _strip_code_fences(s: str) -> str:
+    s = s.strip()
+    s = re.sub(r"```(?:json)?\s*", "", s, flags=re.I)
+    s = s.replace("```", "")
+    return s.strip()
+
+def _extract_content(resp):
+    # Prefer JSON; fall back to text
+    try:
+        data = resp.json()
+        if isinstance(data, dict):
+            if "choices" in data:
+                return data["choices"][0]["message"]["content"]
+            if "output_text" in data:
+                return data["output_text"]
+            if "predictions" in data:
+                return json.dumps(data["predictions"])
+            if "data" in data:
+                return data["data"] if isinstance(data["data"], str) else json.dumps(data["data"])
+            return json.dumps(data)
+        if isinstance(data, list):
+            return json.dumps(data)
+    except Exception:
+        pass
+    return resp.text
+
+def _extract_tag_block(s: str) -> Optional[str]:
+    s = _strip_code_fences(s)
+    m = re.search(re.escape(JSON_START_TAG) + r"(.*?)" + re.escape(JSON_END_TAG), s, flags=re.S)
+    if m:
+        return m.group(1).strip()
+    return None
+
+def _parse_json_list(content_text: str):
+    """
+    Try in order:
+    1) Parse <json>...</json> inner text
+    2) Parse entire content
+    3) Parse first [...] array in content
+    """
+    # 1) tagged block
+    inner = _extract_tag_block(content_text)
+    if inner is not None:
+        try:
+            obj = json.loads(inner)
+            if isinstance(obj, list):
+                return obj
+            if isinstance(obj, dict):
+                return [obj]
+        except Exception:
+            pass
+    # 2) whole content
+    s = _strip_code_fences(content_text)
+    try:
+        obj = json.loads(s)
+        if isinstance(obj, list):
+            return obj
+        if isinstance(obj, dict):
+            for k in ("items","results","data","output","predictions"):
+                if k in obj and isinstance(obj[k], list):
+                    return obj[k]
+            return [obj]
+    except Exception:
+        pass
+    # 3) first [...] array
+    m2 = re.search(r"\[\s*\{.*?\}\s*\]", s, flags=re.S)
+    if m2:
+        try:
+            return json.loads(m2.group(0))
+        except Exception:
+            pass
+    return None
+
+def call_llm_batch(items, rate_limiter: SimpleRateLimiter, max_retries=3):
+    """Single attempt for a given items list (no splitting here)."""
+    rate_limiter.acquire()
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": json.dumps(build_user_payload(items), ensure_ascii=False, separators=(",",":"))}
+    ]
+    body = {"messages": messages, "max_tokens": MAX_TOKENS_OUT, "temperature": TEMPERATURE}
+
+    backoff = 1.0
+    parse_retry = False
+
+    for _ in range(max_retries):
+        resp = requests.post(INVOCATIONS_URL, headers=HEADERS, json=body, timeout=120)
+        if resp.status_code == 200:
+            content = _extract_content(resp)
+            if DEBUG_LLM:
+                print("LLM content preview:", str(content)[:600].replace("\n"," "))
+            parsed = _parse_json_list(content)
+            if isinstance(parsed, list):
+                # normalize/validate
+                allowed_topics_set = {t.strip() for t in TMOBILE_TOPICS}
+                pillar_set = set(PILLAR_LABELS)
+                sent_set = set(SENTIMENT_LABELS)
+                out = []
+                for obj in parsed:
+                    if not isinstance(obj, dict) or "id" not in obj:
+                        continue
+                    _id = str(obj["id"])
+                    summary = (obj.get("summary") or "").strip() or None
+                    pillar = obj.get("pillar") if obj.get("pillar") in pillar_set else None
+                    sentiment = (obj.get("sentiment_label") or "").lower().strip()
+                    sentiment = sentiment if sentiment in sent_set else None
+
+                    topics = obj.get("topics") or []
+                    if isinstance(topics, str): topics = [t.strip() for t in topics.split(",")]
+                    topics = [t for t in topics if t in allowed_topics_set][:4]
+
+                    llm_topics = obj.get("llm_topics") or []
+                    if isinstance(llm_topics, str): llm_topics = [t.strip() for t in llm_topics.split(",")]
+                    llm_topics = [t for t in llm_topics if t][:4]
+
+                    entities = obj.get("entities") or []
+                    if isinstance(entities, str): entities = [e.strip() for e in entities.split(",")]
+                    entities = [e for e in entities if e][:10]
+
+                    conf = obj.get("confidence", None)
+                    try: conf = float(conf) if conf is not None else None
+                    except: conf = None
+
+                    out.append({
+                        "id": _id,
+                        "summary": summary,
+                        "pillar": pillar,
+                        "sentiment_label": sentiment,
+                        "topics": topics,
+                        "llm_topics": llm_topics,
+                        "entities": entities,
+                        "confidence": conf
+                    })
+                return out
+            # one stricter re-ask if parse failed
+            if not parse_retry:
+                parse_retry = True
+                time.sleep(0.6)
+                messages = [
+                    {"role": "system", "content": SYSTEM_PROMPT + "\nCRITICAL: Output ONLY a MINIFIED JSON array wrapped by the tags. No extra text."},
+                    {"role": "user", "content": json.dumps(build_user_payload(items), ensure_ascii=False, separators=(",",":"))}
+                ]
+                body = {"messages": messages, "max_tokens": MAX_TOKENS_OUT, "temperature": TEMPERATURE}
+                continue
+            raise RuntimeError("LLM response did not parse to a JSON list.")
+        if resp.status_code in (429,500,502,503,504):
+            time.sleep(backoff); backoff = min(backoff*2, 30); continue
+        raise RuntimeError(f"LLM HTTP {resp.status_code}: {resp.text[:500]}")
+    raise RuntimeError("Exceeded max retries to LLM endpoint.")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC # 02 - Topic Model and Load to Snowflake Silver table
+
+# COMMAND ----------
+
+# =========================
+# Spark-parallel LLM infer + single MERGE
+# =========================
+# Prereqs: your existing imports + functions (normalize_text, content_hash, _extract_content,
+#          _parse_json_list, _extract_tag_block, build_user_payload, call_llm_batch etc.)
+# Keep SYSTEM_PROMPT, JSON_* tags, and parsing helpers as-is.
+
+from pyspark.sql import functions as F, types as T
+import itertools, requests, json, time, re, hashlib, uuid
+from datetime import datetime, timezone
+
+# ---------- Config knobs ----------
+PARALLELISM        = 16          # number of Spark partitions (tune to <= workers * 4)
+RPM_PER_WORKER     = 2           # per-partition RPM (safe default)
+INITIAL_BATCH_SIZE = 16          # your existing value
+MAX_RECORDS_PER_RUN = 0          # 0 = all (or keep your testing cap)
+MAX_CHARS          = 3072
+TEMPERATURE        = 0.0
+MAX_TOKENS_OUT     = 3072
+DRY_RUN            = False
+DEBUG_LLM          = False
+
+INVOCATIONS_URL = "https://adb-1175023733406058.18.azuredatabricks.net/serving-endpoints/databricks-meta-llama-3-3-70b-instruct/invocations"
+
+# ---------- Auth (get once on driver, broadcast to workers) ----------
+def _get_db_context_auth():
+    ctx = dbutils.notebook.entry_point.getDbutils().notebook().getContext()
+    token = ctx.apiToken().get()
+    if not token:
+        raise RuntimeError("No Databricks API token available from context.")
+    return token
+
+DATABRICKS_TOKEN = _get_db_context_auth()
+HEADERS_DRIVER = {"Authorization": f"Bearer {DATABRICKS_TOKEN}", "Content-Type": "application/json", "Accept": "application/json"}
+
+# Broadcast all “mostly static” bits so workers don’t depend on driver state calls:
+bc_headers  = sc.broadcast(HEADERS_DRIVER)
+bc_topics   = sc.broadcast(topics_df_pd["TMO_TOPIC"].astype(str).unique().tolist())
+bc_pillars  = sc.broadcast(topics_df_pd["TOP_LEVEL_CATEGORY"].astype(str).unique().tolist())
+bc_sent     = sc.broadcast(["positive","negative","neutral"])
+bc_prompt   = sc.broadcast(SYSTEM_PROMPT)
+bc_url      = sc.broadcast(INVOCATIONS_URL)
+
+PROMPT_VERSION = "v1.3.0"
+
+# ---------- Prep input as Spark DF ----------
+df_in = df_pd.copy()
+
+
+df_in["MESSAGE_CONTENT"] = df_in["MESSAGE_CONTENT"].astype(str)
+df_in["text_norm"] = df_in["MESSAGE_CONTENT"].apply(lambda s: normalize_text(s)[:MAX_CHARS])
+df_in = df_in[df_in["text_norm"].str.len() > 0]
+
+# --- sanity checks
+print("Fetched from SQL:", len(df_pd))
+print("After normalize/trim:", len(df_in))
+print("Unique normalized texts:", df_in["text_norm"].nunique())
+print(df_in["text_norm"].value_counts().head(10))
+
+if MAX_RECORDS_PER_RUN:
+    df_in = df_in.head(MAX_RECORDS_PER_RUN)
+#df_in["CONTENT_HASH"] = df_in["text_norm"].apply(lambda s: content_hash(s, PROMPT_VERSION))
+#df_in = df_in.drop_duplicates(subset=["CONTENT_HASH"]).reset_index(drop=True)
+
+from pyspark.sql import types as T, functions as F
+
+# --- Define the schema you'll use for Spark no matter what ---
+in_schema = T.StructType([
+    T.StructField("BRONZE_ID", T.StringType(), False),
+    T.StructField("text_norm", T.StringType(), True),
+    T.StructField("PLATFORM",  T.StringType(), True),
+])
+
+# --- Create spark_in safely even when df_in is empty ---
+if df_in.empty:
+    print("No rows to process: df_in is empty after filtering/dedupe. Creating empty Spark DataFrame.")
+    spark_in = spark.createDataFrame([], in_schema)
+else:
+    # If you want, you can still pass the schema for consistency
+    spark_in = spark.createDataFrame(df_in[["BRONZE_ID","text_norm","PLATFORM"]], schema=in_schema)
+
+# Optionally keep your parallelism
+spark_in = spark_in.repartition(PARALLELISM)
+
+# --- Short-circuit the pipeline if there’s nothing to do ---
+if spark_in.rdd.isEmpty():
+    print("Nothing to process. Skipping LLM calls and MERGE; run considered successful.")
+    # If you write metrics/logs, do it here, then exit the notebook/cell early if desired:
+    # dbutils.notebook.exit("NOOP: 0 rows")
+else:
+    # proceed with your normal processing...
+    # 1) mapPartitions → LLM
+    # 2) assemble spark_out
+    # 3) MERGE into Silver
+    pass
+
+
+# ---------- Shared helpers re-bound for workers ----------
+class SimpleRateLimiter:
+    def __init__(self, rpm: int, window_sec: int = 60):
+        self.rpm = rpm; self.window = window_sec; self.calls = []
+    def acquire(self):
+        now = time.time()
+        self.calls = [t for t in self.calls if now - t < self.window]
+        if len(self.calls) >= self.rpm:
+            sleep_for = self.window - (now - self.calls[0]) + 0.05
+            time.sleep(max(0, sleep_for))
+        self.calls.append(time.time())
+
+def _build_user_payload_worker(items, topics, pillars, sentiments):
+    return {
+        "allowed_topics": topics,
+        "pillar_labels": pillars,
+        "sentiment_labels": sentiments,
+        "items": [{"id": it["id"], "text": it["text"], "platform": it.get("platform")} for it in items]
+    }
+
+def _call_llm_batch_worker(items, rate_limiter, headers, url, system_prompt, max_tokens_out, temperature, debug=False):
+    rate_limiter.acquire()
+    messages = [
+        {"role":"system","content": system_prompt},
+        {"role":"user","content": json.dumps(
+            _build_user_payload_worker(items, bc_topics.value, bc_pillars.value, bc_sent.value),
+            ensure_ascii=False, separators=(",",":"))
+        }
+    ]
+    body = {"messages": messages, "max_tokens": max_tokens_out, "temperature": temperature}
+
+    backoff = 1.0
+    parse_retry = False
+    for _ in range(3):
+        resp = requests.post(url, headers=headers, json=body, timeout=120)
+        if resp.status_code == 200:
+            content = _extract_content(resp)
+            if debug:
+                print("LLM content preview:", str(content)[:400].replace("\n"," "))
+            parsed = _parse_json_list(content)
+            if isinstance(parsed, list):
+                allowed_topics_set = {t.strip() for t in bc_topics.value}
+                pillar_set = set(bc_pillars.value)
+                sent_set = set(bc_sent.value)
+                out = []
+                for obj in parsed:
+                    if not isinstance(obj, dict) or "id" not in obj: continue
+                    _id = str(obj["id"])
+                    summary = (obj.get("summary") or "").strip() or None
+                    pillar = obj.get("pillar") if obj.get("pillar") in pillar_set else None
+                    sentiment = (obj.get("sentiment_label") or "").lower().strip()
+                    sentiment = sentiment if sentiment in sent_set else None
+
+                    topics = obj.get("topics") or []
+                    if isinstance(topics, str): topics = [t.strip() for t in topics.split(",")]
+                    topics = [t for t in topics if t in allowed_topics_set][:4]
+
+                    llm_topics = obj.get("llm_topics") or []
+                    if isinstance(llm_topics, str): llm_topics = [t.strip() for t in llm_topics.split(",")]
+                    llm_topics = [t for t in llm_topics if t][:4]
+
+                    entities = obj.get("entities") or []
+                    if isinstance(entities, str): entities = [e.strip() for e in entities.split(",")]
+                    entities = [e for e in entities if e][:10]
+
+                    conf = obj.get("confidence", None)
+                    try: conf = float(conf) if conf is not None else None
+                    except: conf = None
+
+                    out.append({
+                        "id": _id, "summary": summary, "pillar": pillar,
+                        "sentiment_label": sentiment, "topics": topics,
+                        "llm_topics": llm_topics, "entities": entities,
+                        "confidence": conf
+                    })
+                return out
+
+            if not parse_retry:
+                parse_retry = True
+                time.sleep(0.6)
+                messages = [
+                    {"role":"system","content": system_prompt + "\nCRITICAL: Output ONLY a MINIFIED JSON array wrapped by the tags. No extra text."},
+                    {"role":"user","content": json.dumps(
+                        _build_user_payload_worker(items, bc_topics.value, bc_pillars.value, bc_sent.value),
+                        ensure_ascii=False, separators=(",",":"))
+                    }
+                ]
+                body = {"messages": messages, "max_tokens": max_tokens_out, "temperature": temperature}
+                continue
+            raise RuntimeError("LLM response did not parse to a JSON list.")
+        if resp.status_code in (429,500,502,503,504):
+            time.sleep(backoff); backoff = min(backoff*2, 30); continue
+        raise RuntimeError(f"LLM HTTP {resp.status_code}: {resp.text[:500]}")
+    raise RuntimeError("Exceeded max retries to LLM endpoint.")
+
+def _iter_batches(iterable, n):
+    it = iter(iterable)
+    while True:
+        chunk = list(itertools.islice(it, n))
+        if not chunk: break
+        yield chunk
+
+# ---------- Partition function ----------
+def infer_partition(rows_iter):
+    import requests, json, time
+    headers = bc_headers.value
+    url = bc_url.value
+    system_prompt = bc_prompt.value
+    limiter = SimpleRateLimiter(rpm=RPM_PER_WORKER)
+    now_ts = datetime.now(timezone.utc).replace(tzinfo=None)
+    now_str = now_ts.strftime('%Y-%m-%d %H:%M:%S.%f')
+
+    # Load the partition rows into small dicts
+    buf = []
+    for r in rows_iter:
+        # r is Row(BRONZE_ID, text_norm, PLATFORM)
+        buf.append({"id": r.BRONZE_ID, "text": r.text_norm, "platform": r.PLATFORM})
+
+    # Adaptive loop at partition level
+    i, cur = 0, max(1, int(INITIAL_BATCH_SIZE))
+    results, errors = [], []
+    while i < len(buf):
+        batch = buf[i:i+cur]
+        try:
+            out = _call_llm_batch_worker(batch, limiter, headers, url, system_prompt, MAX_TOKENS_OUT, TEMPERATURE, debug=False)
+            got = {o["id"] for o in out}
+            for it in batch:
+                if it["id"] not in got:
+                    errors.append((it["id"], "LLM_missing_result"))
+            results.extend(out)
+            i += cur
+            if cur < INITIAL_BATCH_SIZE:
+                cur = min(INITIAL_BATCH_SIZE, cur * 2)
+        except Exception as e:
+            if cur > 2:
+                cur = max(1, cur // 2)
+                continue
+            else:
+                errors.append((batch[0]["id"], f"ERROR: {str(e)[:300]}"))
+                i += 1
+                cur = min(INITIAL_BATCH_SIZE, max(1, cur * 2))
+
+    # Map results → Silver-shaped rows
+    def list_to_csv(xs):
+        xs = xs or []
+        return ", ".join([str(x) for x in xs if str(x).strip()])
+
+    src_by_id = {it["id"]: {"MESSAGE_CONTENT": it["text"], "PLATFORM": it.get("platform")} for it in buf}
+    for r in results:
+        topics     = (r.get("topics") or [])[:4]
+        llm_topics = (r.get("llm_topics") or [])[:4]
+        ents       = (r.get("entities") or [])[:4]
+        src = src_by_id.get(r["id"], {})
+        yield (
+            str(r["id"]),
+            src.get("MESSAGE_CONTENT"),
+            src.get("PLATFORM"),
+            r.get("summary"),
+            list_to_csv(topics),
+            list_to_csv(llm_topics),
+            json.dumps(topics, ensure_ascii=False),
+            r.get("pillar"),
+            r.get("sentiment_label"),
+            list_to_csv(ents),
+            list_to_csv(llm_topics),
+            None,  # AI_ERROR
+            topics[0] if len(topics)>0 else None,
+            topics[1] if len(topics)>1 else None,
+            topics[2] if len(topics)>2 else None,
+            topics[3] if len(topics)>3 else None,
+            ents[0] if len(ents)>0 else None,
+            ents[1] if len(ents)>1 else None,
+            ents[2] if len(ents)>2 else None,
+            ents[3] if len(ents)>3 else None,
+            llm_topics[0] if len(llm_topics)>0 else None,
+            llm_topics[1] if len(llm_topics)>1 else None,
+            llm_topics[2] if len(llm_topics)>2 else None,
+            llm_topics[3] if len(llm_topics)>3 else None,
+            now_str
+        )
+
+    for (bid, err) in errors:
+        src = src_by_id.get(bid, {})
+        yield (
+            str(bid),
+            src.get("MESSAGE_CONTENT"),
+            src.get("PLATFORM"),
+            None, None, None, json.dumps([], ensure_ascii=False), None, None, None, None,
+            str(err)[:500],
+            None, None, None, None,
+            None, None, None, None,
+            None, None, None, None,
+            now_str
+        )
+
+# ---------- Output schema ----------
+out_schema = T.StructType([
+    T.StructField("BRONZE_ID", T.StringType()),
+    T.StructField("MESSAGE_CONTENT", T.StringType()),
+    T.StructField("PLATFORM", T.StringType()),
+    T.StructField("AI_SUMMARY", T.StringType()),
+    T.StructField("AI_TOPICS", T.StringType()),
+    T.StructField("AI_TOPICS_RAW", T.StringType()),
+    T.StructField("AI_TOPICS_JSON", T.StringType()),
+    T.StructField("AI_PILLAR", T.StringType()),
+    T.StructField("AI_SENTIMENT_LABEL", T.StringType()),
+    T.StructField("AI_NAMED_ENTITIES", T.StringType()),
+    T.StructField("AI_LLM_TOPICS", T.StringType()),
+    T.StructField("AI_ERROR", T.StringType()),
+    T.StructField("AI_TOPIC_1", T.StringType()),
+    T.StructField("AI_TOPIC_2", T.StringType()),
+    T.StructField("AI_TOPIC_3", T.StringType()),
+    T.StructField("AI_TOPIC_4", T.StringType()),
+    T.StructField("AI_ENTITY_1", T.StringType()),
+    T.StructField("AI_ENTITY_2", T.StringType()),
+    T.StructField("AI_ENTITY_3", T.StringType()),
+    T.StructField("AI_ENTITY_4", T.StringType()),
+    T.StructField("AI_LLM_TOPIC_1", T.StringType()),
+    T.StructField("AI_LLM_TOPIC_2", T.StringType()),
+    T.StructField("AI_LLM_TOPIC_3", T.StringType()),
+    T.StructField("AI_LLM_TOPIC_4", T.StringType()),
+    T.StructField("LOAD_DATE", T.StringType()),
+])
+
+# ---------- Run parallel inference ----------
+spark_out = spark.createDataFrame(
+    spark_in.rdd.mapPartitions(infer_partition),  # <-- use the RDD
+    schema=out_schema
+)
+
+# (Optional) quick sanity check
+display(spark_out.limit(5))
+
+# ---------- Collect OR write, then MERGE once ----------
+# If the result volume is moderate, collecting is simplest:
+df_out = spark_out.toPandas()
+
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC # 03 - Merge to Snowflake Silver Table
+
+# COMMAND ----------
+
+client_id = snflk_client_id 
+client_secret = snflk_client_secret
+redirect_uri = 'https://localhost.com' 
+authorization_endpoint = 'https://tmobile.west-us-2.privatelink.snowflakecomputing.com/oauth/authorize' 
+token_endpoint = 'https://tmobile.west-us-2.privatelink.snowflakecomputing.com/oauth/token-request' 
+refresh_token=snflk_refresh_token
+
+# Generate Access Token 
+
+hdrs = {'Authorization': 'Basic {}'.format(base64.b64encode('{}:{}'.format(client_id, client_secret).encode()).decode()), 
+
+    'Content-type': 'application/x-www-form-urlencoded;charset=utf-8'} 
+
+ 
+
+data = urlencode({ 
+
+        'grant_type': 'refresh_token', 
+
+        'refresh_token': refresh_token, 
+
+        'redirect_uri': redirect_uri 
+
+    }) 
+
+data = data.encode('ascii') 
+
+ 
+
+r = requests.post( 
+
+    token_endpoint, 
+
+    headers=hdrs, 
+
+    data=data) 
+
+ 
+
+ 
+
+access_token = r.json()['access_token'] 
+
+#print('access token: ' + access_token) 
+
+ 
+
+snflk_conn = snowflake.connector.connect( 
+
+    user="RSC_PRD_SF_PBOARD_DI@T-MOBILE.COM", 
+
+    account='tmobile.west-us-2.privatelink', 
+
+    authenticator='oauth', 
+
+    warehouse='BDM_PPDA_DI_PRD_WH_01', 
+
+    database='BDM_PPDA_DB', 
+
+    schema = 'PROD_BOARD_T', 
+
+    token=access_token 
+
+)    
+
+cur = snflk_conn.cursor() 
+
+
+
+#cur.close() 
+
+#ctx.close() 
+ 
+
+
+# COMMAND ----------
+
+df_out = df_out.drop_duplicates(subset='BRONZE_ID', keep='first')
+
+#display(df_out)
+
+# COMMAND ----------
+
+# -------------------------
+# Write-back (MERGE) — requires cur/SILVER_TABLE from Snowflake cell
+# -------------------------
+if DRY_RUN or df_out.empty:
+    print("DRY_RUN is True or no results — skipping MERGE.")
+else:
+    tmp_name = f"TMP_TOPICS_{uuid.uuid4().hex[:8].upper()}"
+    create_sql = f"""
+    CREATE TEMPORARY TABLE {tmp_name} (
+        BRONZE_ID STRING,
+        MESSAGE_CONTENT STRING,
+        PLATFORM STRING,
+        AI_SUMMARY STRING,
+        AI_TOPICS STRING,
+        AI_TOPICS_RAW STRING,
+        AI_TOPICS_JSON VARIANT,
+        AI_PILLAR STRING,
+        AI_SENTIMENT_LABEL STRING,
+        AI_NAMED_ENTITIES STRING,
+        AI_LLM_TOPICS STRING,
+        AI_ERROR STRING,
+        AI_TOPIC_1 STRING,
+        AI_TOPIC_2 STRING,
+        AI_TOPIC_3 STRING,
+        AI_TOPIC_4 STRING,
+        AI_ENTITY_1 STRING,
+        AI_ENTITY_2 STRING,
+        AI_ENTITY_3 STRING,
+        AI_ENTITY_4 STRING,
+        AI_LLM_TOPIC_1 STRING,
+        AI_LLM_TOPIC_2 STRING,
+        AI_LLM_TOPIC_3 STRING,
+        AI_LLM_TOPIC_4 STRING,
+        LOAD_DATE TIMESTAMP_NTZ
+    );
+    """
+    cur.execute(create_sql)
+
+    insert_sql = f"""
+    INSERT INTO {tmp_name} (
+        BRONZE_ID, MESSAGE_CONTENT, PLATFORM,
+        AI_SUMMARY, AI_TOPICS, AI_TOPICS_RAW, AI_TOPICS_JSON, AI_PILLAR,
+        AI_SENTIMENT_LABEL, AI_NAMED_ENTITIES, AI_LLM_TOPICS, AI_ERROR,
+        AI_TOPIC_1, AI_TOPIC_2, AI_TOPIC_3, AI_TOPIC_4,
+        AI_ENTITY_1, AI_ENTITY_2, AI_ENTITY_3, AI_ENTITY_4,
+        AI_LLM_TOPIC_1, AI_LLM_TOPIC_2, AI_LLM_TOPIC_3, AI_LLM_TOPIC_4,
+        LOAD_DATE
+    )
+    SELECT
+        t.$1, t.$2, t.$3,
+        t.$4, t.$5, t.$6, PARSE_JSON(t.$7), t.$8,
+        t.$9, t.$10, t.$11, t.$12,
+        t.$13, t.$14, t.$15, t.$16,
+        t.$17, t.$18, t.$19, t.$20,
+        t.$21, t.$22, t.$23, t.$24,
+        TO_TIMESTAMP_NTZ(t.$25)
+    FROM VALUES (
+        %s,%s,%s,
+        %s,%s,%s,%s,%s,
+        %s,%s,%s,%s,
+        %s,%s,%s,%s,
+        %s,%s,%s,%s,
+        %s,%s,%s,%s,
+        %s
+    ) AS t;
+    """
+    rows = [(
+        r["BRONZE_ID"], r["MESSAGE_CONTENT"], r["PLATFORM"],
+        r["AI_SUMMARY"], r["AI_TOPICS"], r["AI_TOPICS_RAW"], r["AI_TOPICS_JSON"], r["AI_PILLAR"],
+        r["AI_SENTIMENT_LABEL"], r["AI_NAMED_ENTITIES"], r["AI_LLM_TOPICS"], r["AI_ERROR"],
+        r["AI_TOPIC_1"], r["AI_TOPIC_2"], r["AI_TOPIC_3"], r["AI_TOPIC_4"],
+        r["AI_ENTITY_1"], r["AI_ENTITY_2"], r["AI_ENTITY_3"], r["AI_ENTITY_4"],
+        r["AI_LLM_TOPIC_1"], r["AI_LLM_TOPIC_2"], r["AI_LLM_TOPIC_3"], r["AI_LLM_TOPIC_4"],
+        r["LOAD_DATE"]
+    ) for r in df_out.to_dict("records")]
+    cur.executemany(insert_sql, rows)
+
+    merge_sql = f"""
+    MERGE INTO {SILVER_TABLE} AS T
+    USING {tmp_name} AS S
+      ON T.BRONZE_ID = S.BRONZE_ID
+    WHEN MATCHED THEN UPDATE SET
+      T.MESSAGE_CONTENT   = S.MESSAGE_CONTENT,
+      T.PLATFORM          = S.PLATFORM,
+      T.AI_SUMMARY        = S.AI_SUMMARY,
+      T.AI_TOPICS         = S.AI_TOPICS,
+      T.AI_TOPICS_RAW     = S.AI_TOPICS_RAW,
+      T.AI_TOPICS_JSON    = S.AI_TOPICS_JSON,
+      T.AI_PILLAR         = S.AI_PILLAR,
+      T.AI_SENTIMENT_LABEL= S.AI_SENTIMENT_LABEL,
+      T.AI_NAMED_ENTITIES = S.AI_NAMED_ENTITIES,
+      T.AI_LLM_TOPICS     = S.AI_LLM_TOPICS,
+      T.AI_ERROR          = S.AI_ERROR,
+      T.AI_TOPIC_1        = S.AI_TOPIC_1,
+      T.AI_TOPIC_2        = S.AI_TOPIC_2,
+      T.AI_TOPIC_3        = S.AI_TOPIC_3,
+      T.AI_TOPIC_4        = S.AI_TOPIC_4,
+      T.AI_ENTITY_1       = S.AI_ENTITY_1,
+      T.AI_ENTITY_2       = S.AI_ENTITY_2,
+      T.AI_ENTITY_3       = S.AI_ENTITY_3,
+      T.AI_ENTITY_4       = S.AI_ENTITY_4,
+      T.AI_LLM_TOPIC_1    = S.AI_LLM_TOPIC_1,
+      T.AI_LLM_TOPIC_2    = S.AI_LLM_TOPIC_2,
+      T.AI_LLM_TOPIC_3    = S.AI_LLM_TOPIC_3,
+      T.AI_LLM_TOPIC_4    = S.AI_LLM_TOPIC_4,
+      T.LOAD_DATE         = S.LOAD_DATE
+    WHEN NOT MATCHED THEN INSERT (
+      BRONZE_ID, MESSAGE_CONTENT, PLATFORM,
+      AI_SUMMARY, AI_TOPICS, AI_TOPICS_RAW, AI_TOPICS_JSON, AI_PILLAR,
+      AI_SENTIMENT_LABEL, AI_NAMED_ENTITIES, AI_LLM_TOPICS, AI_ERROR,
+      AI_TOPIC_1, AI_TOPIC_2, AI_TOPIC_3, AI_TOPIC_4,
+      AI_ENTITY_1, AI_ENTITY_2, AI_ENTITY_3, AI_ENTITY_4,
+      AI_LLM_TOPIC_1, AI_LLM_TOPIC_2, AI_LLM_TOPIC_3, AI_LLM_TOPIC_4,
+      LOAD_DATE
+    ) VALUES (
+      S.BRONZE_ID, S.MESSAGE_CONTENT, S.PLATFORM,
+      S.AI_SUMMARY, S.AI_TOPICS, S.AI_TOPICS_RAW, S.AI_TOPICS_JSON, S.AI_PILLAR,
+      S.AI_SENTIMENT_LABEL, S.AI_NAMED_ENTITIES, S.AI_LLM_TOPICS, S.AI_ERROR,
+      S.AI_TOPIC_1, S.AI_TOPIC_2, S.AI_TOPIC_3, S.AI_TOPIC_4,
+      S.AI_ENTITY_1, S.AI_ENTITY_2, S.AI_ENTITY_3, S.AI_ENTITY_4,
+      S.AI_LLM_TOPIC_1, S.AI_LLM_TOPIC_2, S.AI_LLM_TOPIC_3, S.AI_LLM_TOPIC_4,
+      S.LOAD_DATE
+    );
+    """
+    cur.execute(merge_sql)
+    print(f"Merged {len(df_out)} rows into {SILVER_TABLE}.")

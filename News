@@ -1,0 +1,441 @@
+# Databricks notebook source
+from datetime import datetime, timedelta
+import requests, time, hashlib, pandas as pd
+from urllib.parse import urlparse, urlunparse, urlencode, quote 
+import base64
+import snowflake.connector
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import lit, to_timestamp, col, from_utc_timestamp
+from pyspark.sql.types import StringType
+
+import pytz
+PACIFIC_TZ = pytz.timezone("America/Los_Angeles")
+
+spark = SparkSession.builder.getOrCreate()
+
+# COMMAND ----------
+
+#-------------- Snowflake Connector 1--------------#
+
+snflk_refresh_token = dbutils.secrets.get(
+    scope="azure_key_vault_backed_databricks_scope",
+    key="RSC-PRD-SNF-PBOARD-DI-RefreshToken",
+)
+
+
+snflk_client_secret = dbutils.secrets.get(
+    scope="azure_key_vault_backed_databricks_scope",
+    key="Snowflake-PI-Client-Secret",
+)
+
+snflk_client_id = dbutils.secrets.get(
+    scope="azure_key_vault_backed_databricks_scope",
+    key="Snowflake-PI-Client-Id",
+)
+ 
+
+
+# COMMAND ----------
+
+#-------------- Snowflake Connector 2 --------------#
+
+client_id = snflk_client_id 
+client_secret = snflk_client_secret
+
+redirect_uri = 'https://localhost.com' 
+authorization_endpoint = 'https://tmobile.west-us-2.privatelink.snowflakecomputing.com/oauth/authorize' 
+token_endpoint = 'https://tmobile.west-us-2.privatelink.snowflakecomputing.com/oauth/token-request' 
+
+refresh_token=snflk_refresh_token
+
+## Generate Access Token 
+hdrs = {'Authorization': 'Basic {}'.format(base64.b64encode('{}:{}'.format(client_id, client_secret).encode()).decode()), 
+    'Content-type': 'application/x-www-form-urlencoded;charset=utf-8'} 
+
+data = urlencode({ 
+        'grant_type': 'refresh_token', 
+        'refresh_token': refresh_token, 
+        'redirect_uri': redirect_uri 
+    }) 
+
+data = data.encode('ascii') 
+
+r = requests.post( 
+    token_endpoint, 
+    headers=hdrs, 
+    data=data) 
+
+access_token = r.json()['access_token'] 
+#print('access token: ' + access_token) 
+
+## Connector
+snflk_conn = snowflake.connector.connect( 
+    user="RSC_PRD_SF_PBOARD_DI@T-MOBILE.COM", 
+    account='tmobile.west-us-2.privatelink', 
+    authenticator='oauth', 
+    warehouse='BDM_PPDA_DI_PRD_WH_01', 
+    database='BDM_PPDA_DB', 
+    schema = 'PROD_BOARD_T', 
+    token=access_token 
+
+)    
+
+#cur = snflk_conn.cursor() 
+
+#cur.close() 
+#ctx.close() 
+
+# COMMAND ----------
+
+# ----------------- Configuration -----------------
+NEWS_API_KEY = dbutils.secrets.get(
+    scope="azure_key_vault_backed_databricks_scope",
+    key="news-api-key",
+) 
+
+# Topics to pull news for
+ENTITY_KEYWORDS = {
+    "T-Mobile": ['"T-Mobile" OR "TMUS" OR "TMobile" NOT "T-Mobile Arena" NOT "T-Mobile Arena\'s" NOT "@T-Mobile Arena" NOT "T-Mobile Park" NOT "T-Mobile Park\'s" NOT "@T-Mobile Park" NOT "T-Mobile Center" NOT "T-Mobile Center\'s" NOT "@T-Mobile Center" NOT "Distrito T-Mobile" NOT "Distrito T-Mobile\'s" NOT "@Distrito T-Mobile"'],
+    "T-Mobile Arena": ['"T-Mobile Arena" OR "T-Mobile Arena\'s" OR "@T-Mobile Arena"'],
+    "T-Mobile Park": ['"T-Mobile Park" OR "T-Mobile Park\'s" OR "@T-Mobile Park"'],
+    "T-Mobile Center": ['"T-Mobile Center" OR "T-Mobile Center\'s" OR "@T-Mobile Center"'],
+    "Distrito T-Mobile": ['"Distrito T-Mobile" OR "Distrito T-Mobile\'s" OR "@Distrito T-Mobile"'],
+    "André Almeida": ['"André Almeida" AND "T-Mobile"'],
+    "Deeanne King": ['"Deeanne King" AND "T-Mobile"'],
+    "Janice Kapner": ['"Janice Kapner" AND "T-Mobile"'],
+    "Jeff Simon": ['"Jeff Simon" AND "T-Mobile"'], ## CIO
+    "John Saw": ['"John Saw" AND "T-Mobile"'], ## CTO
+    "Mark Nelson": ['"Mark Nelson" AND "T-Mobile"'],
+    "Mike Katz": ['"Mike Katz" AND "T-Mobile"'], ## CMO and T-Mobile
+    "Mike Sievert": ["Mike Sievert"],
+    "Nestor Cano": ['"Nestor Cano" AND "T-Mobile"'],
+    "Omar Tazi": ['"Omar Tazi" AND "T-Mobile"'],
+    "Peter Osvaldik": ['"Peter Osvaldik" AND "T-Mobile"'], ## CFO
+    "Srini Gopalan": ['"Srini Gopalan" AND "T-Mobile"', '"T-Mobile CEO" AND "CEO T-Mobile", "CEO, T-Mobile"']
+}
+
+# Some API parameters
+TARGET_TABLE = "NEWS_ARTICLES"       # Your curated table
+STAGE_TABLE  = "NEWS_ARTICLES_STAGE" # Overwritten each run
+
+MAX_PAGE_SIZE = 100
+MAX_PAGES = 20                       # NewsAPI usage/limits
+RETRY_LIMIT = 3
+REQUEST_DELAY_S = 0.25                     
+OVERLAP_MINUTES = 5     
+
+# COMMAND ----------
+
+#-------------Get Watermark from Snowflake-----------#
+
+## Currently rerunning when empty cycles. should not be a problem but in ideal state have a watermark based on notebook was last run
+
+try:
+    cur = snflk_conn.cursor()
+    cur.execute(f"SELECT MAX(LOAD_DATETIME_UTC) AS MAX_TS FROM BDM_PPDA_DB.PROD_BOARD_T.NONSPRINKLR_NEWS_ARTICLES")
+    row = cur.fetchone()
+    cur.close()
+
+    max_ts = row[0]  # Will be None if table is empty
+
+except Exception as e:
+    print(f"⚠️ Error fetching watermark from Snowflake: {e}")
+    max_ts = None  # Fallback to no watermark
+
+# Define pull window: (max_ts - overlap) → now, or 24 hours if no watermark exists
+TO_DATE = datetime.utcnow()  # end time = "now" (UTC)
+if max_ts:
+    #FROM_DATE = max_ts - timedelta(minutes=OVERLAP_MINUTES)
+    FROM_DATE = TO_DATE - timedelta(days=7)
+else:
+    FROM_DATE = TO_DATE - timedelta(days=7)
+
+print("Watermark window (UTC):", FROM_DATE.isoformat(), "→", TO_DATE.isoformat())
+
+## For first pull
+# TO_DATE = datetime.utcnow()
+# FROM_DATE = datetime.utcnow() - timedelta(days=7)
+
+print(FROM_DATE)
+print(TO_DATE)
+
+# COMMAND ----------
+
+from typing import Optional
+
+#------------For UID----------------#
+
+def normalize_url(url: Optional[str]) -> Optional[str]:
+    """
+    Return a normalized URL without query/fragment and without trailing slash.
+    This collapses tracker variants like ?utm_source=... so duplicates match.
+    """
+    if not url:
+        return None
+    p = urlparse(url.strip())
+    scheme = (p.scheme or "https").lower()
+    netloc = (p.netloc or "").lower()
+    path = p.path or "/"
+    if path != "/" and path.endswith("/"):
+        path = path[:-1]
+    return f"{scheme}://{netloc}{path}"
+
+def safe_published_iso(published_at: Optional[str], fallback_dt: datetime) -> str:
+    """
+    Ensure we have a stable ISO string for the published time.
+    If NewsAPI omitted it or it's malformed, fall back to current UTC.
+    """
+    try:
+        if published_at:
+            return str(published_at).strip()
+    except Exception:
+        pass
+    return fallback_dt.isoformat()
+
+def build_uid(url: Optional[str], published_at_iso: str) -> str:
+    """
+    Build a stable UID = SHA256(normalized_url + '_' + published_at_iso).
+    If URL is missing, caller should decide an alternate (e.g., title-based) UID.
+    """
+    norm = normalize_url(url) or ""
+    return hashlib.sha256(f"{norm}_{published_at_iso}".encode("utf-8")).hexdigest()
+
+# COMMAND ----------
+
+#---------- Fetch News Articles---------------#
+
+def fetch_news_for_keyword(keyword: str, start: datetime, end: datetime):
+    """
+    Pull paginated results from NewsAPI for a single keyword within [start, end].
+    Handles transient errors with exponential backoff.
+    """
+    batch = []                                    # list of article dicts to return
+    for page in range(1, MAX_PAGES + 1):          # iterate pages up to cap
+        for attempt in range(RETRY_LIMIT):        # transient error retries
+            try:
+                # Build request params
+                params = {
+                    "q": keyword,                 # search query
+                    "from": start.isoformat(),    # inclusive lower bound
+                    "to": end.isoformat(),        # inclusive upper bound
+                    "language": "en",             # English articles
+                    "sortBy": "publishedAt",      # time sort
+                    "pageSize": MAX_PAGE_SIZE,    # number of results per page
+                    "page": page,                 # current page
+                    "apiKey": NEWS_API_KEY        # auth
+                }
+                # Make HTTP call (30s timeout is conservative)
+                r = requests.get("https://newsapi.org/v2/everything", params=params, timeout=30)
+                if r.status_code == 200:
+                    data = r.json()                               # parse JSON payload
+                    articles = data.get("articles", [])           # list of article dicts
+                    now_iso = datetime.utcnow().isoformat()       # consistent fetched_at for this page
+
+                    for a in articles:
+                        # Extract fields
+                        title = a.get("title")
+                        url = a.get("url")
+                        pub_iso = safe_published_iso(a.get("publishedAt"), fallback_dt=datetime.utcnow())
+                        uid = build_uid(url, pub_iso)     # stable dedup key
+                        if not url:
+                            title_key = (title or "").strip()
+                            uid = hashlib.sha256(f"titleonly_{title_key}_{pub_iso}".encode("utf-8")).hexdigest()
+
+                        # Append raw record (entity set later in the outer loop)
+                        batch.append({
+                            "uid": uid,
+                            "entity": None,                       # filled when looping entities
+                            "keyword": keyword,
+                            "title": title,
+                            "description": a.get("description"),
+                            "author": a.get("author"),
+                            "source": (a.get("source") or {}).get("name"),
+                            "url": url,
+                            "normalized_url": normalize_url(url),
+                            "publishedAt": a.get("publishedAt"),
+                            "fetched_at": now_iso,
+                        })
+
+                    # If fewer than a full page returned, we've reached the end.
+                    if len(articles) < MAX_PAGE_SIZE:
+                        return batch
+
+                    # Break out of retry loop on success
+                    break
+                else:
+                    # Log error status and back off; continue retry loop
+                    print(f"[{keyword}] page {page} → HTTP {r.status_code}: {r.text[:200]}")
+                    time.sleep(2 ** attempt)
+
+            except Exception as e:
+                # Log exception and back off; continue retry loop
+                print(f"[{keyword}] page {page} attempt {attempt+1}/{RETRY_LIMIT} error: {e}")
+                time.sleep(2 ** attempt)
+
+        # Throttle between pages to respect quota (tune for paid tier)
+        time.sleep(REQUEST_DELAY_S)
+
+    return batch
+
+
+#-------Loop all entities/keywords---------#
+
+rows = []                                            # accumulator for all articles
+for entity, keywords in ENTITY_KEYWORDS.items():     # iterate entities
+    for kw in keywords:                              # iterate each keyword per entity
+        print(f"🔎 {entity} | {kw}")
+        items = fetch_news_for_keyword(kw, FROM_DATE, TO_DATE)
+        for it in items:
+            it["entity"] = entity                    # stamp entity name now
+        rows.extend(items)                           # add to accumulator
+        time.sleep(REQUEST_DELAY_S)                # small delay between keyword calls
+
+
+#--------Pandas Dedup---------#
+
+pdf = pd.DataFrame(rows)                             # convert to Pandas
+
+#display(pdf)
+
+if pdf.empty:
+    print("No new rows fetched.")
+    dbutils.notebook.exit("Notebook finished early — success.")
+else:
+    # Drop duplicates by UID to collapse cross-keyword duplicates
+    pdf.drop_duplicates(subset=["uid", "entity"], inplace=True)
+    print(f"Fetched rows (post in-memory dedup): {len(pdf)}")
+
+# Convert to Spark DataFrame for scalable transforms & Snowflake write
+df_raw = spark.createDataFrame(pdf)                              # Pandas → Spark DF
+df_raw = df_raw.dropDuplicates(["uid", "entity"])                # extra safety dedup in Spark
+
+#display(df_raw)
+
+# COMMAND ----------
+
+display(df_raw)
+
+# COMMAND ----------
+
+# -------------- Cleaning / transformations -----------------#
+# Rename to standardized column names, add empty columns for future needs,
+# cast timestamps, and select final column order
+df_int = (
+    df_raw.withColumnRenamed(
+        "entity", "executive_org_name"
+    )  # entity → organization
+    .withColumnRenamed("keyword", "search_term")  # keyword → search_term
+    .withColumnRenamed("title", "article_title")  # title → article_title
+    .withColumnRenamed(
+        "description", "article_summary"
+    )  # description → article_summary
+    .withColumnRenamed("author", "article_author")  # author → article_author
+    .withColumnRenamed("source", "source_name")  # source → source_name
+    .withColumnRenamed("url", "article_url")  # url → article_url
+    .withColumnRenamed(
+        "publishedAt", "published_datetime_utc"
+    )  # publishedAt → published_at
+    .withColumnRenamed(
+        "fetched_at", "load_datetime_utc"
+    )  # fetched_at → ingested_at
+    # # Add placeholder columns for downstream enrichment
+    # .withColumn("sentiment",     lit(None).cast(StringType()))  # empty sentiment column
+    # .withColumn("theme", lit(None).cast(StringType()))  # empty theme column
+    # Cast string timestamps to Spark timestamps (let Snowflake map to TIMESTAMP_NTZ)
+    .withColumn(
+        "published_datetime_utc", to_timestamp(col("published_datetime_utc"))
+    )
+    .withColumn("load_datetime_utc", to_timestamp(col("load_datetime_utc")))
+    # Reorder columns to a clean canonical schema (include normalized_url for audit)
+    .select(
+        "uid",
+        "executive_org_name",
+        "article_title",
+        "article_summary",
+        # "sentiment",
+        # "theme",
+        "article_author",
+        "source_name",
+        "article_url",
+        "published_datetime_utc",
+        "load_datetime_utc",
+    )
+    .dropDuplicates(["uid", "executive_org_name"])  # final guard against dupes pre-write
+)
+
+# Add Pacific dateime columns
+df_final = (
+    df_int
+    # Convert from UTC → Pacific; result is a timestamp representing local PT clock time
+    .withColumn(
+        "published_datetime_pt",
+        from_utc_timestamp(col("published_datetime_utc"), "America/Los_Angeles"),
+    ).withColumn(
+        "load_datetime_pt",
+        from_utc_timestamp(col("load_datetime_utc"), "America/Los_Angeles"),
+    )
+)
+
+# COMMAND ----------
+
+display(df_final)
+
+# COMMAND ----------
+
+#------------ Write To Snowflake; Staging Table -----------#
+
+from pyspark.sql import DataFrame as SparkDataFrame
+
+# ---------------------------
+# Overwrite stage table with the current batch (Spark → Snowflake)
+# Using the Spark connector for the write
+# ---------------------------
+(
+    df_final.write
+        .format("snowflake")
+        .option("sfURL", f"tmobile.west-us-2.privatelink.snowflakecomputing.com")
+        .option("sfUser", snflk_conn.user)
+        .option("sfWarehouse", snflk_conn.warehouse)
+        .option("sfDatabase", snflk_conn.database)
+        .option("sfSchema", snflk_conn.schema)
+        .option("sfAuthenticator", "oauth")
+        .option("sfToken", access_token)
+        .option("dbtable", 'NONSPRINKLR_NEWS_ARTICLES_STAGE')
+        .mode("overwrite")
+        .save()
+)
+print("Wrote batch to Snowflake stage (via Spark).")
+
+# COMMAND ----------
+
+#------------ Write To Snowflake; Upsert into Final Table -----------#
+
+# ---------------------------
+# Run MERGE in Snowflake using the existing Python connection
+# ---------------------------
+merge_sql = f"""
+MERGE INTO BDM_PPDA_DB.PROD_BOARD_T.NONSPRINKLR_NEWS_ARTICLES t
+USING BDM_PPDA_DB.PROD_BOARD_T.NONSPRINKLR_NEWS_ARTICLES_STAGE s
+  ON t.UID = s.UID
+  AND t.EXECUTIVE_ORG_NAME = s.EXECUTIVE_ORG_NAME
+WHEN NOT MATCHED THEN INSERT (
+  UID, EXECUTIVE_ORG_NAME,  
+  ARTICLE_TITLE, ARTICLE_SUMMARY, ARTICLE_AUTHOR, 
+  SOURCE_NAME, ARTICLE_URL, 
+  PUBLISHED_DATETIME_UTC, LOAD_DATETIME_UTC,
+  PUBLISHED_DATETIME_PT, LOAD_DATETIME_PT
+) VALUES (
+  s.UID, s.EXECUTIVE_ORG_NAME,  
+  s.ARTICLE_TITLE, s.ARTICLE_SUMMARY, s.ARTICLE_AUTHOR, 
+  s.SOURCE_NAME, s.ARTICLE_URL, 
+  s.PUBLISHED_DATETIME_UTC, s.LOAD_DATETIME_UTC,
+  s.PUBLISHED_DATETIME_PT, s.LOAD_DATETIME_PT
+);
+"""
+
+cur = snflk_conn.cursor()
+cur.execute(merge_sql)
+cur.close()
+
+print("Snowflake MERGE complete.")

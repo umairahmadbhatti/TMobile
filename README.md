@@ -1,942 +1,658 @@
+# Databricks notebook source
+# MAGIC %md
+# MAGIC # Ingest social data from Sprinklr via API call
+# MAGIC
+# MAGIC October 2025
+# MAGIC
+# MAGIC Details about authorizing Sprinklr account and generating auth token elsewhere
+# MAGIC
+# MAGIC Focus of this notebook is to successfully generate API payloads and load them into Snowflake db
 
-{
- "cells": [
-  {
-   "cell_type": "markdown",
-   "metadata": {
-    "application/vnd.databricks.v1+cell": {
-     "cellMetadata": {
-      "byteLimit": 2048000,
-      "rowLimit": 10000
-     },
-     "inputWidgets": {},
-     "nuid": "dcb8345a-8340-428d-aa34-b64add7bcf9b",
-     "showTitle": false,
-     "tableResultSettingsMap": {},
-     "title": ""
-    }
-   },
-   "source": [
-    "# Ingest social data from Sprinklr via API call\n",
-    "\n",
-    "October 2025\n",
-    "\n",
-    "Details about authorizing Sprinklr account and generating auth token elsewhere\n",
-    "\n",
-    "Focus of this notebook is to successfully generate API payloads and load them into Snowflake db"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": 0,
-   "metadata": {
-    "application/vnd.databricks.v1+cell": {
-     "cellMetadata": {
-      "byteLimit": 2048000,
-      "rowLimit": 10000
-     },
-     "inputWidgets": {},
-     "nuid": "be5681ac-7eb3-41a3-9acc-b9f0a32fef7b",
-     "showTitle": false,
-     "tableResultSettingsMap": {},
-     "title": ""
-    }
-   },
-   "outputs": [],
-   "source": [
-    "import sys\n",
-    "import time\n",
-    "from time import sleep\n",
-    "import datetime\n",
-    "import splunklib.client as client\n",
-    "#from utils import parse\n",
-    "from datetime import timedelta\n",
-    "import splunklib.results as results\n",
-    "import pandas as pd\n",
-    "from io import BytesIO\n",
-    "import sqlalchemy as sa\n",
-    "import urllib\n",
-    "from dateutil import parser\n",
-    "from functools import reduce\n",
-    "import os\n",
-    "import snowflake.connector as snow\n",
-    "import pyodbc\n",
-    "from openpyxl import load_workbook\n",
-    "from snowflake.connector.pandas_tools import write_pandas\n",
-    "import numpy as np\n",
-    "from office365.runtime.auth.authentication_context import AuthenticationContext\n",
-    "from office365.sharepoint.client_context import ClientContext\n",
-    "from office365.runtime.auth.client_credential import ClientCredential\n",
-    "from office365.sharepoint.files.file import File\n",
-    "from pyspark.sql import functions as F\n",
-    "from pyspark.sql.functions import lit\n",
-    "from datetime import datetime\n",
-    "import io\n",
-    "from datetime import date\n",
-    "from urllib.parse import quote\n",
-    "import snowflake.connector \n",
-    "import base64 \n",
-    "import random \n",
-    "import json \n",
-    "import ssl \n",
-    "from urllib.parse import urlparse, urlunparse, urlencode, quote \n",
-    "from tabulate import tabulate \n",
-    "import requests\n",
-    "import string"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": 0,
-   "metadata": {
-    "application/vnd.databricks.v1+cell": {
-     "cellMetadata": {
-      "byteLimit": 2048000,
-      "rowLimit": 10000
-     },
-     "inputWidgets": {},
-     "nuid": "8b5b29fa-de59-43a0-ac03-eae74c3ee2c1",
-     "showTitle": false,
-     "tableResultSettingsMap": {},
-     "title": ""
-    }
-   },
-   "outputs": [],
-   "source": [
-    "\n",
-    "snflk_refresh_token = dbutils.secrets.get(\n",
-    "    scope=\"azure_key_vault_backed_databricks_scope\",\n",
-    "    key=\"RSC-PRD-SNF-PBOARD-DI-RefreshToken\",\n",
-    ")\n",
-    "\n",
-    "\n",
-    "snflk_client_secret = dbutils.secrets.get(\n",
-    "    scope=\"azure_key_vault_backed_databricks_scope\",\n",
-    "    key=\"Snowflake-PI-Client-Secret\",\n",
-    ")\n",
-    "\n",
-    "snflk_client_id = dbutils.secrets.get(\n",
-    "    scope=\"azure_key_vault_backed_databricks_scope\",\n",
-    "    key=\"Snowflake-PI-Client-Id\",\n",
-    ")"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": 0,
-   "metadata": {
-    "application/vnd.databricks.v1+cell": {
-     "cellMetadata": {
-      "byteLimit": 2048000,
-      "rowLimit": 10000
-     },
-     "inputWidgets": {},
-     "nuid": "015a723c-4844-4a91-9316-fa09142f7671",
-     "showTitle": true,
-     "tableResultSettingsMap": {},
-     "title": "Cell 4"
-    },
-    "jupyter": {
-     "outputs_hidden": true
-    }
-   },
-   "outputs": [
-    {
-     "output_type": "stream",
-     "name": "stdout",
-     "output_type": "stream",
-     "text": [
-      "Stopping: empty rows at page=0\nFetched rows: 0\n"
-     ]
-    }
-   ],
-   "source": [
-    "# Databricks cell: fetch Sprinklr (SprinkSights / Listening) report with pagination, return Spark DF\n",
-    "# Assumes you already have a Sprinklr auth token (or can fetch it in a separate cell).\n",
-    "# Set these in Databricks secrets or env:\n",
-    "#   - SPRINKLR_BASE_URL  (e.g., https://<your-tenant>.sprinklr.com)\n",
-    "#   - SPRINKLR_BEARER_TOKEN  (or use your existing OAuth flow)\n",
-    "\n",
-    "#import os, json, time\n",
-    "#import requests\n",
-    "#import pandas as pd\n",
-    "#from pyspark.sql import functions as F\n",
-    "\n",
-    "import time, json\n",
-    "import requests\n",
-    "from requests.adapters import HTTPAdapter\n",
-    "from urllib3.util.retry import Retry\n",
-    "\n",
-    "# -----------------------\n",
-    "# 1) Config / auth\n",
-    "# -----------------------\n",
-    "BASE_URL = \"https://api2.sprinklr.com/prod2/api/v2/reports/query\"\n",
-    "TOKEN = os.getenv(\"SPRINKLR_BEARER_TOKEN\")\n",
-    "\n",
-    "# Common Sprinklr analytics endpoint (adjust if your tenant uses a different path)\n",
-    "# If your prior notebook already has the correct endpoint, swap it in here.\n",
-    "ENDPOINT = \"https://api2.sprinklr.com/prod2/api/v2/reports/query\"\n",
-    "\n",
-    "HEADERS = {\n",
-    "    'Authorization': 'Bearer Lu62hTQMXpcUGqTl5pOR4Zs57EexPiSqf2WzmXjzMbliMjEzZTM3OS04ZDE1LTM3YzMtYTAwOC1mOGQ2MzE1YWFkNjU=', # USE ACCESS TOKEN (NOT REFRESH TOKEN) from Auth Flow\n",
-    "    'cache-control': 'no-cache',\n",
-    "    'key': '4h7ruvbfxhcsaa5w9z9rches',\n",
-    "    \"Content-Type\": \"application/json\",\n",
-    "}\n",
-    "\n",
-    "# -----------------------\n",
-    "# 2) Your payload (as-is)\n",
-    "# -----------------------\n",
-    "payload = {\n",
-    "    \"report\": \"SPRINKSIGHTS\",\n",
-    "    \"reportingEngine\": \"LISTENING\",\n",
-    "    \"timeField\": None,\n",
-    "    \"startTime\": 1769932800000,\n",
-    "    \"endTime\": 1770105599999,\n",
-    "    \"timeZone\": \"America/Los_Angeles\",\n",
-    "    \"page\": 0,\n",
-    "    \"pageSize\": 20,\n",
-    "    \"filters\": [\n",
-    "        {\n",
-    "            \"dimensionName\": \"TOPIC_IDS\",\n",
-    "            \"filterType\": \"IN\",\n",
-    "            \"values\": [\n",
-    "                \"6629305d0e208512f2efc310\",\n",
-    "                \"66216770a83a8771b7d34f9e\",\n",
-    "                \"662131f2a83a8771b7769e39\",\n",
-    "                \"687a9556b903ed6d8880c935\"\n",
-    "            ],\n",
-    "            \"details\": {\n",
-    "                \"uniqueId\": \"D_TOPIC_IDS\",\n",
-    "                \"contentType\": \"DB_FILTER\",\n",
-    "                \"dF\": True,\n",
-    "                \"DB_FILTER_REPORT_NAME\": \"SPRINKSIGHTS\",\n",
-    "                \"OLD_DIM_NAME\": \"TOPIC\",\n",
-    "                \"HAS_ALERT\": False,\n",
-    "                \"nameQueryLookupSupported\": \"True\",\n",
-    "                \"DRILLDOWN\": False,\n",
-    "                \"displayNameForWarning\": \"Topic\",\n",
-    "                \"EXIST_FILTER\": False,\n",
-    "                \"HAS_TOOLTIP_DATA\": True\n",
-    "            }\n",
-    "        },\n",
-    "        {\n",
-    "            \"dimensionName\": \"LISTENING_MEDIA_TYPE\",\n",
-    "            \"filterType\": \"IN\",\n",
-    "            \"values\": [\n",
-    "                \"INSTAGRAM\",\n",
-    "                \"FACEBOOK\",\n",
-    "                \"SNAPCHAT\",\n",
-    "                \"TWITTER\",\n",
-    "                \"BLUESKY\",\n",
-    "                \"REDDIT\",\n",
-    "                \"TIKTOK\",\n",
-    "                \"YOUTUBE\",\n",
-    "                \"NEWS\",\n",
-    "                \"FORUMS\"\n",
-    "            ],\n",
-    "            \"details\": {\n",
-    "                \"uniqueId\": \"D_LISTENING_MEDIA_TYPE\",\n",
-    "                \"contentType\": \"DB_FILTER\",\n",
-    "                \"DB_FILTER_REPORT_NAME\": \"SPRINKSIGHTS\",\n",
-    "                \"OLD_DIM_NAME\": \"LISTENING_MEDIA_TYPE\",\n",
-    "                \"HAS_ALERT\": False,\n",
-    "                \"nameQueryLookupSupported\": \"True\",\n",
-    "                \"supportedMediaCSV\": \"ALL_SOURCES\",\n",
-    "                \"displayNameForWarning\": \"Source\",\n",
-    "                \"HAS_TOOLTIP_DATA\": True\n",
-    "            }\n",
-    "        },\n",
-    "        {\n",
-    "            \"dimensionName\": \"LST_SUPP_LNG\",\n",
-    "            \"filterType\": \"IN\",\n",
-    "            \"values\": [\n",
-    "                \"en\",\n",
-    "                \"es\"\n",
-    "            ],\n",
-    "            \"details\": {\n",
-    "                \"uniqueId\": \"D_LST_SUPP_LNG\",\n",
-    "                \"contentType\": \"DB_FILTER\",\n",
-    "                \"DB_FILTER_REPORT_NAME\": \"SPRINKSIGHTS\",\n",
-    "                \"OLD_DIM_NAME\": \"LANGUAGE\",\n",
-    "                \"HAS_ALERT\": False,\n",
-    "                \"nameQueryLookupSupported\": \"True\",\n",
-    "                \"supportedMediaCSV\": \"ALL_SOURCES\",\n",
-    "                \"displayNameForWarning\": \"Language\",\n",
-    "                \"HAS_TOOLTIP_DATA\": True\n",
-    "            }\n",
-    "        }\n",
-    "    ],\n",
-    "    \"groupBys\": [\n",
-    "        {\n",
-    "            \"heading\": \"ES_MESSAGE_ID_0\",\n",
-    "            \"dimensionName\": \"ES_MESSAGE_ID\",\n",
-    "            \"groupType\": \"FIELD\",\n",
-    "            \"details\": {},\n",
-    "            \"namedFilters\": None\n",
-    "        },\n",
-    "        {\n",
-    "            \"heading\": \"MESSAGE_CONTENT_1\",\n",
-    "            \"dimensionName\": \"MESSAGE_CONTENT\",\n",
-    "            \"groupType\": \"FIELD\",\n",
-    "            \"details\": {},\n",
-    "            \"namedFilters\": None\n",
-    "        },\n",
-    "        {\n",
-    "            \"heading\": \"LISTENING_MEDIA_TYPE_2\",\n",
-    "            \"dimensionName\": \"LISTENING_MEDIA_TYPE\",\n",
-    "            \"groupType\": \"FIELD\",\n",
-    "            \"details\": {},\n",
-    "            \"namedFilters\": None\n",
-    "        },\n",
-    "        {\n",
-    "            \"heading\": \"SN_CREATED_TIME_3\",\n",
-    "            \"dimensionName\": \"SN_CREATED_TIME\",\n",
-    "            \"groupType\": \"DATE_HISTOGRAM\",\n",
-    "            \"details\": {\n",
-    "                \"isDateTypeDimension\": True,\n",
-    "                \"interval\": \"1d\"\n",
-    "            },\n",
-    "            \"namedFilters\": None\n",
-    "        },\n",
-    "        {\n",
-    "            \"heading\": \"TOPIC_IDS_4\",\n",
-    "            \"dimensionName\": \"TOPIC_IDS\",\n",
-    "            \"groupType\": \"FIELD\",\n",
-    "            \"details\": {},\n",
-    "            \"namedFilters\": None\n",
-    "        },\n",
-    "        {\n",
-    "            \"heading\": \"ACCOUNT_ID_5\",\n",
-    "            \"dimensionName\": \"ACCOUNT_ID\",\n",
-    "            \"groupType\": \"FIELD\",\n",
-    "            \"details\": {},\n",
-    "            \"namedFilters\": None\n",
-    "        },\n",
-    "        {\n",
-    "            \"heading\": \"FROM_SN_USER_6\",\n",
-    "            \"dimensionName\": \"FROM_SN_USER\",\n",
-    "            \"groupType\": \"FIELD\",\n",
-    "            \"details\": {},\n",
-    "            \"namedFilters\": None\n",
-    "        },\n",
-    "        {\n",
-    "            \"heading\": \"SN_MESSAGE_TYPE_7\",\n",
-    "            \"dimensionName\": \"SN_MESSAGE_TYPE\",\n",
-    "            \"groupType\": \"FIELD\",\n",
-    "            \"details\": {},\n",
-    "            \"namedFilters\": None\n",
-    "        },\n",
-    "        {\n",
-    "            \"heading\": \"SEM_SENTIMENT_8\",\n",
-    "            \"dimensionName\": \"SEM_SENTIMENT\",\n",
-    "            \"groupType\": \"FIELD\",\n",
-    "            \"details\": {},\n",
-    "            \"namedFilters\": None\n",
-    "        },\n",
-    "        {\n",
-    "            \"heading\": \"AGE_CATEGORY_9\",\n",
-    "            \"dimensionName\": \"AGE_CATEGORY\",\n",
-    "            \"groupType\": \"FIELD\",\n",
-    "            \"details\": {},\n",
-    "            \"namedFilters\": None\n",
-    "        },\n",
-    "        {\n",
-    "            \"heading\": \"CITY_10\",\n",
-    "            \"dimensionName\": \"CITY\",\n",
-    "            \"groupType\": \"FIELD\",\n",
-    "            \"details\": {},\n",
-    "            \"namedFilters\": None\n",
-    "        },\n",
-    "        {\n",
-    "            \"heading\": \"STATE_11\",\n",
-    "            \"dimensionName\": \"STATE\",\n",
-    "            \"groupType\": \"FIELD\",\n",
-    "            \"details\": {},\n",
-    "            \"namedFilters\": None\n",
-    "        },\n",
-    "        {\n",
-    "            \"heading\": \"GENDER_12\",\n",
-    "            \"dimensionName\": \"GENDER\",\n",
-    "            \"groupType\": \"FIELD\",\n",
-    "            \"details\": {},\n",
-    "            \"namedFilters\": None\n",
-    "        },\n",
-    "        {\n",
-    "            \"heading\": \"HASHTAGS_13\",\n",
-    "            \"dimensionName\": \"HASHTAGS\",\n",
-    "            \"groupType\": \"FIELD\",\n",
-    "            \"details\": {},\n",
-    "            \"namedFilters\": None\n",
-    "        },\n",
-    "        {\n",
-    "            \"heading\": \"MSG_EMOTION_14\",\n",
-    "            \"dimensionName\": \"MSG_EMOTION\",\n",
-    "            \"groupType\": \"FIELD\",\n",
-    "            \"details\": {},\n",
-    "            \"namedFilters\": None\n",
-    "        },\n",
-    "        {\n",
-    "            \"heading\": \"MSG_EMOTION_CAT_15\",\n",
-    "            \"dimensionName\": \"MSG_EMOTION_CAT\",\n",
-    "            \"groupType\": \"FIELD\",\n",
-    "            \"details\": {},\n",
-    "            \"namedFilters\": None\n",
-    "        },\n",
-    "        {\n",
-    "            \"heading\": \"SPECIFIC_TOPIC_GROUP_60da30ccc3ab97721ce4ced3_16\",\n",
-    "            \"dimensionName\": \"SPECIFIC_TOPIC_GROUP_60da30ccc3ab97721ce4ced3\",\n",
-    "            \"groupType\": \"FIELD\",\n",
-    "            \"details\": {},\n",
-    "            \"namedFilters\": None\n",
-    "        }\n",
-    "    ],\n",
-    "    \"projections\": [\n",
-    "        {\n",
-    "            \"heading\": \"M_SPRINKSIGHTS_MENTIONS_COUNT_0\",\n",
-    "            \"measurementName\": \"MENTIONS_COUNT\",\n",
-    "            \"aggregateFunction\": \"SUM\",\n",
-    "            \"details\": {}\n",
-    "        },\n",
-    "        {\n",
-    "            \"heading\": \"M_SPRINKSIGHTS_REACH_COUNT_1\",\n",
-    "            \"measurementName\": \"REACH_COUNT\",\n",
-    "            \"aggregateFunction\": \"SUM\",\n",
-    "            \"details\": {}\n",
-    "        },\n",
-    "        {\n",
-    "            \"heading\": \"M_SPRINKSIGHTS_EARNED_ENGAGEMENT_2\",\n",
-    "            \"measurementName\": \"EARNED_ENGAGEMENT\",\n",
-    "            \"aggregateFunction\": \"SUM\",\n",
-    "            \"details\": {}\n",
-    "        },\n",
-    "        {\n",
-    "            \"heading\": \"M_SPRINKSIGHTS_COMMENTS_COUNT_3\",\n",
-    "            \"measurementName\": \"COMMENTS_COUNT\",\n",
-    "            \"aggregateFunction\": \"SUM\",\n",
-    "            \"details\": {}\n",
-    "        },\n",
-    "        {\n",
-    "            \"heading\": \"M_SPRINKSIGHTS_LIKES_COUNT_4\",\n",
-    "            \"measurementName\": \"LIKES_COUNT\",\n",
-    "            \"aggregateFunction\": \"SUM\",\n",
-    "            \"details\": {}\n",
-    "        },\n",
-    "        {\n",
-    "            \"heading\": \"M_SPRINKSIGHTS_SHARES_COUNT_5\",\n",
-    "            \"measurementName\": \"SHARES_COUNT\",\n",
-    "            \"aggregateFunction\": \"SUM\",\n",
-    "            \"details\": {}\n",
-    "        },\n",
-    "        {\n",
-    "            \"heading\": \"M_SPRINKSIGHTS_TWITTER_RETWEETS_6\",\n",
-    "            \"measurementName\": \"TWITTER_RETWEETS\",\n",
-    "            \"aggregateFunction\": \"SUM\",\n",
-    "            \"details\": {}\n",
-    "        },\n",
-    "        {\n",
-    "            \"heading\": \"M_SPRINKSIGHTS_MENTIONS_EX_RETWEETS_7\",\n",
-    "            \"measurementName\": \"MENTIONS_EX_RETWEETS\",\n",
-    "            \"aggregateFunction\": \"SUM\",\n",
-    "            \"details\": {}\n",
-    "        },\n",
-    "        {\n",
-    "            \"heading\": \"M_SPRINKSIGHTS_SAD_COUNT_8\",\n",
-    "            \"measurementName\": \"SAD_COUNT\",\n",
-    "            \"aggregateFunction\": \"SUM\",\n",
-    "            \"details\": {}\n",
-    "        },\n",
-    "        {\n",
-    "            \"heading\": \"M_SPRINKSIGHTS_ANGER_COUNT_9\",\n",
-    "            \"measurementName\": \"ANGER_COUNT\",\n",
-    "            \"aggregateFunction\": \"SUM\",\n",
-    "            \"details\": {}\n",
-    "        },\n",
-    "        {\n",
-    "            \"heading\": \"M_SPRINKSIGHTS_LOVE_COUNT_10\",\n",
-    "            \"measurementName\": \"LOVE_COUNT\",\n",
-    "            \"aggregateFunction\": \"SUM\",\n",
-    "            \"details\": {}\n",
-    "        },\n",
-    "        {\n",
-    "            \"heading\": \"M_SPRINKSIGHTS_FOLLOWERS_COUNT_MEASUREMENT_11\",\n",
-    "            \"measurementName\": \"FOLLOWERS_COUNT_MEASUREMENT\",\n",
-    "            \"aggregateFunction\": \"MAX\",\n",
-    "            \"details\": {}\n",
-    "        },\n",
-    "        {\n",
-    "            \"heading\": \"M_SPRINKSIGHTS_INFLUENCER_SCORE_12\",\n",
-    "            \"measurementName\": \"INFLUENCER_SCORE\",\n",
-    "            \"aggregateFunction\": \"MAX\",\n",
-    "            \"details\": {}\n",
-    "        }\n",
-    "    ],\n",
-    "    \"projectionDecorations\": [],\n",
-    "    \"projectionFilters\": None,\n",
-    "    \"sorts\": None,\n",
-    "    \"streamRequestInfo\": None,\n",
-    "    \"additional\": {\n",
-    "        \"Timezone\": \"America/Los_Angeles\",\n",
-    "        \"exportInfo\": \"False\",\n",
-    "        \"MARGIN\": \"False\",\n",
-    "        \"translateResponse\": \"False\",\n",
-    "        \"fetchUnhealthyAccounts\": \"False\",\n",
-    "        \"dashboardId\": \"697a912c1012e93a37a937db\",\n",
-    "        \"engine\": \"LISTENING\",\n",
-    "        \"widgetId\": \"697a91501012e93a37a95305\",\n",
-    "        \"showTotal\": \"False\",\n",
-    "        \"chartType\": \"POST_CARD\",\n",
-    "        \"TABULAR\": \"True\"\n",
-    "    },\n",
-    "    \"skipResolve\": False,\n",
-    "    \"jsonResponse\": True\n",
-    "}\n",
-    "\n",
-    "\n",
-    "def make_session():\n",
-    "    s = requests.Session()\n",
-    "    retry = Retry(\n",
-    "        total=8,\n",
-    "        backoff_factor=0.5,\n",
-    "        status_forcelist=(429, 500, 502, 503, 504),\n",
-    "        allowed_methods=frozenset([\"POST\"]),\n",
-    "        raise_on_status=False,\n",
-    "    )\n",
-    "    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)\n",
-    "    s.mount(\"https://\", adapter)\n",
-    "    return s\n",
-    "\n",
-    "SESSION = make_session()\n",
-    "\n",
-    "def _sprinklr_post(json_payload: dict, timeout_s: int = 120) -> dict:\n",
-    "    resp = SESSION.post(ENDPOINT, headers=HEADERS, json=json_payload, timeout=timeout_s)\n",
-    "    if not resp.ok:\n",
-    "        raise RuntimeError(\n",
-    "            f\"Sprinklr request failed: HTTP {resp.status_code}\\n\"\n",
-    "            f\"URL: {ENDPOINT}\\n\"\n",
-    "            f\"Response: {resp.text[:4000]}\"\n",
-    "        )\n",
-    "    return resp.json()\n",
-    "\n",
-    "def _extract_rows(obj: dict) -> list[dict]:\n",
-    "    \"\"\"\n",
-    "    Sprinklr responses vary by widget/report. This tries the common patterns.\n",
-    "    - If your tenant returns a different shape, add a branch here.\n",
-    "    \"\"\"\n",
-    "    if obj is None:\n",
-    "        return []\n",
-    "    # common candidates\n",
-    "    candidates = [\n",
-    "        obj.get(\"data\"),\n",
-    "        obj.get(\"rows\"),\n",
-    "        obj.get(\"result\"),\n",
-    "        (obj.get(\"response\") or {}).get(\"data\"),\n",
-    "        (obj.get(\"response\") or {}).get(\"rows\"),\n",
-    "        (obj.get(\"response\") or {}).get(\"result\"),\n",
-    "        (obj.get(\"content\") or {}).get(\"data\"),\n",
-    "        (obj.get(\"content\") or {}).get(\"rows\"),\n",
-    "    ]\n",
-    "    for c in candidates:\n",
-    "        if isinstance(c, list):\n",
-    "            return c\n",
-    "        # sometimes wrapped like {\"data\": {\"rows\":[...]}}\n",
-    "        if isinstance(c, dict):\n",
-    "            for k in (\"rows\", \"data\", \"result\"):\n",
-    "                if isinstance(c.get(k), list):\n",
-    "                    return c.get(k)\n",
-    "    return []\n",
-    "\n",
-    "def fetch_all_pages(\n",
-    "    base_payload: dict,\n",
-    "    page_size: int = 500,          # <= 1000 recommended (timeouts above that) :contentReference[oaicite:4]{index=4}\n",
-    "    max_pages: int = 500,\n",
-    "    max_rows: int = 50_000,        # safety cap; adjust if your endpoint supports more\n",
-    "    sleep_s: float = 0.0\n",
-    ") -> list[dict]:\n",
-    "    all_rows = []\n",
-    "    page = int(base_payload.get(\"page\", 0))\n",
-    "\n",
-    "    # Detect pagination loops (same page repeated)\n",
-    "    seen_signatures = set()\n",
-    "\n",
-    "    t0 = time.perf_counter()\n",
-    "\n",
-    "    for i in range(max_pages):\n",
-    "        p = dict(base_payload)\n",
-    "        p[\"page\"] = page\n",
-    "        p[\"pageSize\"] = page_size\n",
-    "\n",
-    "        out = _sprinklr_post(p)\n",
-    "        rows = _extract_rows(out)\n",
-    "\n",
-    "        if not rows:\n",
-    "            print(f\"Stopping: empty rows at page={page}\")\n",
-    "            break\n",
-    "\n",
-    "        # signature: first row stable identifier if present, else a hash of first row\n",
-    "        first = rows[0]\n",
-    "        sig = (\n",
-    "            first.get(\"ES_MESSAGE_ID\")\n",
-    "            or first.get(\"id\")\n",
-    "            or hash(json.dumps(first, sort_keys=True))\n",
-    "        )\n",
-    "        if sig in seen_signatures:\n",
-    "            print(f\"Stopping: detected repeating page at page={page} (loop protection)\")\n",
-    "            break\n",
-    "        seen_signatures.add(sig)\n",
-    "\n",
-    "        all_rows.extend(rows)\n",
-    "\n",
-    "        elapsed = time.perf_counter() - t0\n",
-    "        print(f\"page={page} rows={len(rows)} total={len(all_rows)} elapsed={elapsed:,.1f}s\")\n",
-    "\n",
-    "        # stop if last page OR safety caps hit\n",
-    "        if len(rows) < page_size:\n",
-    "            print(f\"Stopping: last page (rows {len(rows)} < pageSize {page_size})\")\n",
-    "            break\n",
-    "        if len(all_rows) >= max_rows:\n",
-    "            print(f\"Stopping: reached max_rows={max_rows}\")\n",
-    "            break\n",
-    "\n",
-    "        page += 1\n",
-    "        if sleep_s:\n",
-    "            time.sleep(sleep_s)\n",
-    "\n",
-    "    return all_rows\n",
-    "\n",
-    "rows = fetch_all_pages(payload, page_size=500, max_pages=500, max_rows=50_000)\n",
-    "print(f\"Fetched rows: {len(rows)}\")\n",
-    "\n"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": 0,
-   "metadata": {
-    "application/vnd.databricks.v1+cell": {
-     "cellMetadata": {
-      "byteLimit": 2048000,
-      "rowLimit": 10000
-     },
-     "inputWidgets": {},
-     "nuid": "0ac55250-9e06-49f7-a2e6-f21e6cf61c57",
-     "showTitle": true,
-     "tableResultSettingsMap": {},
-     "title": "Cell 5"
-    }
-   },
-   "outputs": [
-    {
-     "output_type": "stream",
-     "name": "stdout",
-     "output_type": "stream",
-     "text": [
-      "Got page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\nGot page with 20 rows\n"
-     ]
-    }
-   ],
-   "source": [
-    "def stream_pages_as_dataframes(api_url, headers, payload_base, max_pages=None, sleep_between=SLEEP_BETWEEN_PAGES):\n",
-    "    page = 0\n",
-    "    pages_fetched = 0\n",
-    "    seen_ids = set()\n",
-    "\n",
-    "    while True:\n",
-    "        if max_pages is not None and pages_fetched >= max_pages:\n",
-    "            break\n",
-    "        payload = dict(payload_base)\n",
-    "        payload['page'] = page\n",
-    "        resp_json = post_with_retries(api_url, payload, headers)\n",
-    "        data = resp_json.get('data', {}) if isinstance(resp_json, dict) else {}\n",
-    "        rows = data.get('rows', []) if isinstance(data, dict) else []\n",
-    "        if not rows:\n",
-    "            break\n",
-    "        df_page = page_to_dataframe(data)\n",
-    "        # optional dedupe similar to above...\n",
-    "        yield df_page\n",
-    "        pages_fetched += 1\n",
-    "        page += 1\n",
-    "        has_more = data.get('hasMore', None)\n",
-    "        if has_more is False:\n",
-    "            break\n",
-    "        if has_more is None and len(rows) < payload_base.get('pageSize', 100):\n",
-    "            break\n",
-    "        time.sleep(sleep_between)\n",
-    "\n",
-    "# Example consumption:\n",
-    "for page_df in stream_pages_as_dataframes(API_URL, HEADERS, payload_base):\n",
-    "    print(\"Got page with\", len(page_df), \"rows\")\n",
-    "    # process page_df here (e.g., save to file, transform, etc.)\n"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": 0,
-   "metadata": {
-    "application/vnd.databricks.v1+cell": {
-     "cellMetadata": {
-      "byteLimit": 2048000,
-      "rowLimit": 10000
-     },
-     "inputWidgets": {},
-     "nuid": "ec203b3f-4a97-4a0f-a719-21e8a58560c3",
-     "showTitle": false,
-     "tableResultSettingsMap": {},
-     "title": ""
-    }
-   },
-   "outputs": [
-    {
-     "output_type": "display_data",
-     "data": {
-      "text/html": [
-       "<style scoped>\n",
-       "  .ansiout {\n",
-       "    display: block;\n",
-       "    unicode-bidi: embed;\n",
-       "    white-space: pre-wrap;\n",
-       "    word-wrap: break-word;\n",
-       "    word-break: break-all;\n",
-       "    font-family: \"Menlo\", \"Monaco\", \"Consolas\", \"Ubuntu Mono\", \"Source Code Pro\", monospace;\n",
-       "    font-size: 13px;\n",
-       "    color: #555;\n",
-       "    margin-left: 4px;\n",
-       "    line-height: 19px;\n",
-       "  }\n",
-       "</style>"
-      ]
-     },
-     "metadata": {
-      "application/vnd.databricks.v1+output": {
-       "arguments": {},
-       "data": "",
-       "errorSummary": "Cancelled",
-       "errorTraceType": "html",
-       "metadata": {},
-       "type": "ipynbError"
-      }
-     },
-     "output_type": "display_data"
-    }
-   ],
-   "source": [
-    "client_id = snflk_client_id \n",
-    "client_secret = snflk_client_secret\n",
-    "redirect_uri = 'https://localhost.com' \n",
-    "authorization_endpoint = 'https://tmobile.west-us-2.privatelink.snowflakecomputing.com/oauth/authorize' \n",
-    "token_endpoint = 'https://tmobile.west-us-2.privatelink.snowflakecomputing.com/oauth/token-request' \n",
-    "refresh_token=snflk_refresh_token\n",
-    "\n",
-    "# Generate Access Token \n",
-    "\n",
-    "hdrs = {'Authorization': 'Basic {}'.format(base64.b64encode('{}:{}'.format(client_id, client_secret).encode()).decode()), \n",
-    "\n",
-    "    'Content-type': 'application/x-www-form-urlencoded;charset=utf-8'} \n",
-    "\n",
-    " \n",
-    "\n",
-    "data = urlencode({ \n",
-    "\n",
-    "        'grant_type': 'refresh_token', \n",
-    "\n",
-    "        'refresh_token': refresh_token, \n",
-    "\n",
-    "        'redirect_uri': redirect_uri \n",
-    "\n",
-    "    }) \n",
-    "\n",
-    "data = data.encode('ascii') \n",
-    "\n",
-    " \n",
-    "\n",
-    "r = requests.post( \n",
-    "\n",
-    "    token_endpoint, \n",
-    "\n",
-    "    headers=hdrs, \n",
-    "\n",
-    "    data=data) \n",
-    "\n",
-    " \n",
-    "\n",
-    " \n",
-    "\n",
-    "access_token = r.json()['access_token'] \n",
-    "\n",
-    "#print('access token: ' + access_token) \n",
-    "\n",
-    " \n",
-    "\n",
-    "snflk_conn = snowflake.connector.connect( \n",
-    "\n",
-    "    user=\"RSC_PRD_SF_PBOARD_DI@T-MOBILE.COM\", \n",
-    "\n",
-    "    account='tmobile.west-us-2.privatelink', \n",
-    "\n",
-    "    authenticator='oauth', \n",
-    "\n",
-    "    warehouse='BDM_PPDA_DI_PRD_WH_01', \n",
-    "\n",
-    "    database='BDM_PPDA_DB', \n",
-    "\n",
-    "    schema = 'PROD_BOARD_T', \n",
-    "\n",
-    "    token=access_token \n",
-    "\n",
-    ")    \n",
-    "\n",
-    "cur = snflk_conn.cursor() \n",
-    "\n",
-    "\n",
-    "\n",
-    "#cur.close() \n",
-    "\n",
-    "#ctx.close() \n",
-    " \n"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": 0,
-   "metadata": {
-    "application/vnd.databricks.v1+cell": {
-     "cellMetadata": {
-      "byteLimit": 2048000,
-      "rowLimit": 10000
-     },
-     "inputWidgets": {},
-     "nuid": "edff0484-bb29-4652-8bc8-51a3917327bf",
-     "showTitle": false,
-     "tableResultSettingsMap": {
-      "0": {
-       "dataGridStateBlob": "{\"version\":1,\"tableState\":{\"columnPinning\":{\"left\":[\"#row_number#\"],\"right\":[]},\"columnSizing\":{},\"columnVisibility\":{}},\"settings\":{\"columns\":{\"ES_MESSAGE_ID_0__permalink\":{\"format\":{\"preset\":\"string-preset-url\",\"locale\":\"en\"}}}},\"syncTimestamp\":1769140371396}",
-       "filterBlob": null,
-       "queryPlanFiltersBlob": null,
-       "tableResultIndex": 0
-      }
-     },
-     "title": ""
-    }
-   },
-   "outputs": [
-    {
-     "output_type": "display_data",
-     "data": {
-      "text/html": [
-       "<style scoped>\n",
-       "  .ansiout {\n",
-       "    display: block;\n",
-       "    unicode-bidi: embed;\n",
-       "    white-space: pre-wrap;\n",
-       "    word-wrap: break-word;\n",
-       "    word-break: break-all;\n",
-       "    font-family: \"Menlo\", \"Monaco\", \"Consolas\", \"Ubuntu Mono\", \"Source Code Pro\", monospace;\n",
-       "    font-size: 13px;\n",
-       "    color: #555;\n",
-       "    margin-left: 4px;\n",
-       "    line-height: 19px;\n",
-       "  }\n",
-       "</style>"
-      ]
-     },
-     "metadata": {
-      "application/vnd.databricks.v1+output": {
-       "arguments": {},
-       "data": "",
-       "errorSummary": "Cancelled",
-       "errorTraceType": "html",
-       "metadata": {},
-       "type": "ipynbError"
-      }
-     },
-     "output_type": "display_data"
-    }
-   ],
-   "source": [
-    "display(df_all)"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": 0,
-   "metadata": {
-    "application/vnd.databricks.v1+cell": {
-     "cellMetadata": {
-      "byteLimit": 2048000,
-      "rowLimit": 10000
-     },
-     "inputWidgets": {},
-     "nuid": "64200fa6-9954-4064-b3b9-cf330e70f3e5",
-     "showTitle": false,
-     "tableResultSettingsMap": {},
-     "title": ""
-    }
-   },
-   "outputs": [
-    {
-     "output_type": "display_data",
-     "data": {
-      "text/html": [
-       "<style scoped>\n",
-       "  .ansiout {\n",
-       "    display: block;\n",
-       "    unicode-bidi: embed;\n",
-       "    white-space: pre-wrap;\n",
-       "    word-wrap: break-word;\n",
-       "    word-break: break-all;\n",
-       "    font-family: \"Menlo\", \"Monaco\", \"Consolas\", \"Ubuntu Mono\", \"Source Code Pro\", monospace;\n",
-       "    font-size: 13px;\n",
-       "    color: #555;\n",
-       "    margin-left: 4px;\n",
-       "    line-height: 19px;\n",
-       "  }\n",
-       "</style>"
-      ]
-     },
-     "metadata": {
-      "application/vnd.databricks.v1+output": {
-       "arguments": {},
-       "data": "",
-       "errorSummary": "Cancelled",
-       "errorTraceType": "html",
-       "metadata": {},
-       "type": "ipynbError"
-      }
-     },
-     "output_type": "display_data"
-    }
-   ],
-   "source": [
-    "\n",
-    "write_pandas(\n",
-    "    snflk_conn,\n",
-    "    df_all,\n",
-    "    \"TSENTIMENT_SPRINKLR_RAW\",\n",
-    "    auto_create_table=True\n",
-    ")"
-   ]
-  }
- ],
- "metadata": {
-  "application/vnd.databricks.v1+notebook": {
-   "computePreferences": null,
-   "dashboards": [],
-   "environmentMetadata": {
-    "base_environment": "",
-    "environment_version": "2"
-   },
-   "inputWidgetPreferences": null,
-   "language": "python",
-   "notebookMetadata": {
-    "pythonIndentUnit": 2
-   },
-   "notebookName": "Load_Sprinklr_Data_to_RAW_table",
-   "widgets": {}
-  },
-  "language_info": {
-   "name": "python"
-  }
- },
- "nbformat": 4,
- "nbformat_minor": 0
+# COMMAND ----------
+
+import sys
+import time
+from time import sleep
+import datetime
+import splunklib.client as client
+#from utils import parse
+from datetime import timedelta
+import splunklib.results as results
+import pandas as pd
+from io import BytesIO
+import sqlalchemy as sa
+import urllib
+from dateutil import parser
+from functools import reduce
+import os
+import snowflake.connector as snow
+import pyodbc
+from openpyxl import load_workbook
+from snowflake.connector.pandas_tools import write_pandas
+import numpy as np
+from office365.runtime.auth.authentication_context import AuthenticationContext
+from office365.sharepoint.client_context import ClientContext
+from office365.runtime.auth.client_credential import ClientCredential
+from office365.sharepoint.files.file import File
+from pyspark.sql import functions as F
+from pyspark.sql.functions import lit
+from datetime import datetime
+import io
+from datetime import date
+from urllib.parse import quote
+import snowflake.connector 
+import base64 
+import random 
+import json 
+import ssl 
+from urllib.parse import urlparse, urlunparse, urlencode, quote 
+from tabulate import tabulate 
+import requests
+import string
+
+# COMMAND ----------
+
+
+snflk_refresh_token = dbutils.secrets.get(
+    scope="azure_key_vault_backed_databricks_scope",
+    key="RSC-PRD-SNF-PBOARD-DI-RefreshToken",
+)
+
+
+snflk_client_secret = dbutils.secrets.get(
+    scope="azure_key_vault_backed_databricks_scope",
+    key="Snowflake-PI-Client-Secret",
+)
+
+snflk_client_id = dbutils.secrets.get(
+    scope="azure_key_vault_backed_databricks_scope",
+    key="Snowflake-PI-Client-Id",
+)
+
+# COMMAND ----------
+
+# DBTITLE 1,Cell 4
+# Databricks cell: fetch Sprinklr (SprinkSights / Listening) report with pagination, return Spark DF
+# Assumes you already have a Sprinklr auth token (or can fetch it in a separate cell).
+# Set these in Databricks secrets or env:
+#   - SPRINKLR_BASE_URL  (e.g., https://<your-tenant>.sprinklr.com)
+#   - SPRINKLR_BEARER_TOKEN  (or use your existing OAuth flow)
+
+#import os, json, time
+#import requests
+#import pandas as pd
+#from pyspark.sql import functions as F
+
+import time, json
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+# -----------------------
+# 1) Config / auth
+# -----------------------
+BASE_URL = "https://api2.sprinklr.com/prod2/api/v2/reports/query"
+TOKEN = os.getenv("SPRINKLR_BEARER_TOKEN")
+
+# Common Sprinklr analytics endpoint (adjust if your tenant uses a different path)
+# If your prior notebook already has the correct endpoint, swap it in here.
+ENDPOINT = "https://api2.sprinklr.com/prod2/api/v2/reports/query"
+
+HEADERS = {
+    'Authorization': 'Bearer Lu62hTQMXpcUGqTl5pOR4Zs57EexPiSqf2WzmXjzMbliMjEzZTM3OS04ZDE1LTM3YzMtYTAwOC1mOGQ2MzE1YWFkNjU=', # USE ACCESS TOKEN (NOT REFRESH TOKEN) from Auth Flow
+    'cache-control': 'no-cache',
+    'key': '4h7ruvbfxhcsaa5w9z9rches',
+    "Content-Type": "application/json",
 }
+
+# -----------------------
+# 2) Your payload (as-is)
+# -----------------------
+payload = {
+    "report": "SPRINKSIGHTS",
+    "reportingEngine": "LISTENING",
+    "timeField": None,
+    "startTime": 1769932800000,
+    "endTime": 1770105599999,
+    "timeZone": "America/Los_Angeles",
+    "page": 0,
+    "pageSize": 20,
+    "filters": [
+        {
+            "dimensionName": "TOPIC_IDS",
+            "filterType": "IN",
+            "values": [
+                "6629305d0e208512f2efc310",
+                "66216770a83a8771b7d34f9e",
+                "662131f2a83a8771b7769e39",
+                "687a9556b903ed6d8880c935"
+            ],
+            "details": {
+                "uniqueId": "D_TOPIC_IDS",
+                "contentType": "DB_FILTER",
+                "dF": True,
+                "DB_FILTER_REPORT_NAME": "SPRINKSIGHTS",
+                "OLD_DIM_NAME": "TOPIC",
+                "HAS_ALERT": False,
+                "nameQueryLookupSupported": "True",
+                "DRILLDOWN": False,
+                "displayNameForWarning": "Topic",
+                "EXIST_FILTER": False,
+                "HAS_TOOLTIP_DATA": True
+            }
+        },
+        {
+            "dimensionName": "LISTENING_MEDIA_TYPE",
+            "filterType": "IN",
+            "values": [
+                "INSTAGRAM",
+                "FACEBOOK",
+                "SNAPCHAT",
+                "TWITTER",
+                "BLUESKY",
+                "REDDIT",
+                "TIKTOK",
+                "YOUTUBE",
+                "NEWS",
+                "FORUMS"
+            ],
+            "details": {
+                "uniqueId": "D_LISTENING_MEDIA_TYPE",
+                "contentType": "DB_FILTER",
+                "DB_FILTER_REPORT_NAME": "SPRINKSIGHTS",
+                "OLD_DIM_NAME": "LISTENING_MEDIA_TYPE",
+                "HAS_ALERT": False,
+                "nameQueryLookupSupported": "True",
+                "supportedMediaCSV": "ALL_SOURCES",
+                "displayNameForWarning": "Source",
+                "HAS_TOOLTIP_DATA": True
+            }
+        },
+        {
+            "dimensionName": "LST_SUPP_LNG",
+            "filterType": "IN",
+            "values": [
+                "en",
+                "es"
+            ],
+            "details": {
+                "uniqueId": "D_LST_SUPP_LNG",
+                "contentType": "DB_FILTER",
+                "DB_FILTER_REPORT_NAME": "SPRINKSIGHTS",
+                "OLD_DIM_NAME": "LANGUAGE",
+                "HAS_ALERT": False,
+                "nameQueryLookupSupported": "True",
+                "supportedMediaCSV": "ALL_SOURCES",
+                "displayNameForWarning": "Language",
+                "HAS_TOOLTIP_DATA": True
+            }
+        }
+    ],
+    "groupBys": [
+        {
+            "heading": "ES_MESSAGE_ID_0",
+            "dimensionName": "ES_MESSAGE_ID",
+            "groupType": "FIELD",
+            "details": {},
+            "namedFilters": None
+        },
+        {
+            "heading": "MESSAGE_CONTENT_1",
+            "dimensionName": "MESSAGE_CONTENT",
+            "groupType": "FIELD",
+            "details": {},
+            "namedFilters": None
+        },
+        {
+            "heading": "LISTENING_MEDIA_TYPE_2",
+            "dimensionName": "LISTENING_MEDIA_TYPE",
+            "groupType": "FIELD",
+            "details": {},
+            "namedFilters": None
+        },
+        {
+            "heading": "SN_CREATED_TIME_3",
+            "dimensionName": "SN_CREATED_TIME",
+            "groupType": "DATE_HISTOGRAM",
+            "details": {
+                "isDateTypeDimension": True,
+                "interval": "1d"
+            },
+            "namedFilters": None
+        },
+        {
+            "heading": "TOPIC_IDS_4",
+            "dimensionName": "TOPIC_IDS",
+            "groupType": "FIELD",
+            "details": {},
+            "namedFilters": None
+        },
+        {
+            "heading": "ACCOUNT_ID_5",
+            "dimensionName": "ACCOUNT_ID",
+            "groupType": "FIELD",
+            "details": {},
+            "namedFilters": None
+        },
+        {
+            "heading": "FROM_SN_USER_6",
+            "dimensionName": "FROM_SN_USER",
+            "groupType": "FIELD",
+            "details": {},
+            "namedFilters": None
+        },
+        {
+            "heading": "SN_MESSAGE_TYPE_7",
+            "dimensionName": "SN_MESSAGE_TYPE",
+            "groupType": "FIELD",
+            "details": {},
+            "namedFilters": None
+        },
+        {
+            "heading": "SEM_SENTIMENT_8",
+            "dimensionName": "SEM_SENTIMENT",
+            "groupType": "FIELD",
+            "details": {},
+            "namedFilters": None
+        },
+        {
+            "heading": "AGE_CATEGORY_9",
+            "dimensionName": "AGE_CATEGORY",
+            "groupType": "FIELD",
+            "details": {},
+            "namedFilters": None
+        },
+        {
+            "heading": "CITY_10",
+            "dimensionName": "CITY",
+            "groupType": "FIELD",
+            "details": {},
+            "namedFilters": None
+        },
+        {
+            "heading": "STATE_11",
+            "dimensionName": "STATE",
+            "groupType": "FIELD",
+            "details": {},
+            "namedFilters": None
+        },
+        {
+            "heading": "GENDER_12",
+            "dimensionName": "GENDER",
+            "groupType": "FIELD",
+            "details": {},
+            "namedFilters": None
+        },
+        {
+            "heading": "HASHTAGS_13",
+            "dimensionName": "HASHTAGS",
+            "groupType": "FIELD",
+            "details": {},
+            "namedFilters": None
+        },
+        {
+            "heading": "MSG_EMOTION_14",
+            "dimensionName": "MSG_EMOTION",
+            "groupType": "FIELD",
+            "details": {},
+            "namedFilters": None
+        },
+        {
+            "heading": "MSG_EMOTION_CAT_15",
+            "dimensionName": "MSG_EMOTION_CAT",
+            "groupType": "FIELD",
+            "details": {},
+            "namedFilters": None
+        },
+        {
+            "heading": "SPECIFIC_TOPIC_GROUP_60da30ccc3ab97721ce4ced3_16",
+            "dimensionName": "SPECIFIC_TOPIC_GROUP_60da30ccc3ab97721ce4ced3",
+            "groupType": "FIELD",
+            "details": {},
+            "namedFilters": None
+        }
+    ],
+    "projections": [
+        {
+            "heading": "M_SPRINKSIGHTS_MENTIONS_COUNT_0",
+            "measurementName": "MENTIONS_COUNT",
+            "aggregateFunction": "SUM",
+            "details": {}
+        },
+        {
+            "heading": "M_SPRINKSIGHTS_REACH_COUNT_1",
+            "measurementName": "REACH_COUNT",
+            "aggregateFunction": "SUM",
+            "details": {}
+        },
+        {
+            "heading": "M_SPRINKSIGHTS_EARNED_ENGAGEMENT_2",
+            "measurementName": "EARNED_ENGAGEMENT",
+            "aggregateFunction": "SUM",
+            "details": {}
+        },
+        {
+            "heading": "M_SPRINKSIGHTS_COMMENTS_COUNT_3",
+            "measurementName": "COMMENTS_COUNT",
+            "aggregateFunction": "SUM",
+            "details": {}
+        },
+        {
+            "heading": "M_SPRINKSIGHTS_LIKES_COUNT_4",
+            "measurementName": "LIKES_COUNT",
+            "aggregateFunction": "SUM",
+            "details": {}
+        },
+        {
+            "heading": "M_SPRINKSIGHTS_SHARES_COUNT_5",
+            "measurementName": "SHARES_COUNT",
+            "aggregateFunction": "SUM",
+            "details": {}
+        },
+        {
+            "heading": "M_SPRINKSIGHTS_TWITTER_RETWEETS_6",
+            "measurementName": "TWITTER_RETWEETS",
+            "aggregateFunction": "SUM",
+            "details": {}
+        },
+        {
+            "heading": "M_SPRINKSIGHTS_MENTIONS_EX_RETWEETS_7",
+            "measurementName": "MENTIONS_EX_RETWEETS",
+            "aggregateFunction": "SUM",
+            "details": {}
+        },
+        {
+            "heading": "M_SPRINKSIGHTS_SAD_COUNT_8",
+            "measurementName": "SAD_COUNT",
+            "aggregateFunction": "SUM",
+            "details": {}
+        },
+        {
+            "heading": "M_SPRINKSIGHTS_ANGER_COUNT_9",
+            "measurementName": "ANGER_COUNT",
+            "aggregateFunction": "SUM",
+            "details": {}
+        },
+        {
+            "heading": "M_SPRINKSIGHTS_LOVE_COUNT_10",
+            "measurementName": "LOVE_COUNT",
+            "aggregateFunction": "SUM",
+            "details": {}
+        },
+        {
+            "heading": "M_SPRINKSIGHTS_FOLLOWERS_COUNT_MEASUREMENT_11",
+            "measurementName": "FOLLOWERS_COUNT_MEASUREMENT",
+            "aggregateFunction": "MAX",
+            "details": {}
+        },
+        {
+            "heading": "M_SPRINKSIGHTS_INFLUENCER_SCORE_12",
+            "measurementName": "INFLUENCER_SCORE",
+            "aggregateFunction": "MAX",
+            "details": {}
+        }
+    ],
+    "projectionDecorations": [],
+    "projectionFilters": None,
+    "sorts": None,
+    "streamRequestInfo": None,
+    "additional": {
+        "Timezone": "America/Los_Angeles",
+        "exportInfo": "False",
+        "MARGIN": "False",
+        "translateResponse": "False",
+        "fetchUnhealthyAccounts": "False",
+        "dashboardId": "697a912c1012e93a37a937db",
+        "engine": "LISTENING",
+        "widgetId": "697a91501012e93a37a95305",
+        "showTotal": "False",
+        "chartType": "POST_CARD",
+        "TABULAR": "True"
+    },
+    "skipResolve": False,
+    "jsonResponse": True
+}
+
+
+def make_session():
+    s = requests.Session()
+    retry = Retry(
+        total=8,
+        backoff_factor=0.5,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["POST"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
+    s.mount("https://", adapter)
+    return s
+
+SESSION = make_session()
+
+def _sprinklr_post(json_payload: dict, timeout_s: int = 120) -> dict:
+    resp = SESSION.post(ENDPOINT, headers=HEADERS, json=json_payload, timeout=timeout_s)
+    if not resp.ok:
+        raise RuntimeError(
+            f"Sprinklr request failed: HTTP {resp.status_code}\n"
+            f"URL: {ENDPOINT}\n"
+            f"Response: {resp.text[:4000]}"
+        )
+    return resp.json()
+
+def _extract_rows(obj: dict) -> list[dict]:
+    """
+    Sprinklr responses vary by widget/report. This tries the common patterns.
+    - If your tenant returns a different shape, add a branch here.
+    """
+    if obj is None:
+        return []
+    # common candidates
+    candidates = [
+        obj.get("data"),
+        obj.get("rows"),
+        obj.get("result"),
+        (obj.get("response") or {}).get("data"),
+        (obj.get("response") or {}).get("rows"),
+        (obj.get("response") or {}).get("result"),
+        (obj.get("content") or {}).get("data"),
+        (obj.get("content") or {}).get("rows"),
+    ]
+    for c in candidates:
+        if isinstance(c, list):
+            return c
+        # sometimes wrapped like {"data": {"rows":[...]}}
+        if isinstance(c, dict):
+            for k in ("rows", "data", "result"):
+                if isinstance(c.get(k), list):
+                    return c.get(k)
+    return []
+
+def fetch_all_pages(
+    base_payload: dict,
+    page_size: int = 500,          # <= 1000 recommended (timeouts above that) :contentReference[oaicite:4]{index=4}
+    max_pages: int = 500,
+    max_rows: int = 50_000,        # safety cap; adjust if your endpoint supports more
+    sleep_s: float = 0.0
+) -> list[dict]:
+    all_rows = []
+    page = int(base_payload.get("page", 0))
+
+    # Detect pagination loops (same page repeated)
+    seen_signatures = set()
+
+    t0 = time.perf_counter()
+
+    for i in range(max_pages):
+        p = dict(base_payload)
+        p["page"] = page
+        p["pageSize"] = page_size
+
+        out = _sprinklr_post(p)
+        rows = _extract_rows(out)
+
+        if not rows:
+            print(f"Stopping: empty rows at page={page}")
+            break
+
+        # signature: first row stable identifier if present, else a hash of first row
+        first = rows[0]
+        sig = (
+            first.get("ES_MESSAGE_ID")
+            or first.get("id")
+            or hash(json.dumps(first, sort_keys=True))
+        )
+        if sig in seen_signatures:
+            print(f"Stopping: detected repeating page at page={page} (loop protection)")
+            break
+        seen_signatures.add(sig)
+
+        all_rows.extend(rows)
+
+        elapsed = time.perf_counter() - t0
+        print(f"page={page} rows={len(rows)} total={len(all_rows)} elapsed={elapsed:,.1f}s")
+
+        # stop if last page OR safety caps hit
+        if len(rows) < page_size:
+            print(f"Stopping: last page (rows {len(rows)} < pageSize {page_size})")
+            break
+        if len(all_rows) >= max_rows:
+            print(f"Stopping: reached max_rows={max_rows}")
+            break
+
+        page += 1
+        if sleep_s:
+            time.sleep(sleep_s)
+
+    return all_rows
+
+rows = fetch_all_pages(payload, page_size=500, max_pages=500, max_rows=50_000)
+print(f"Fetched rows: {len(rows)}")
+
+
+
+# COMMAND ----------
+
+# DBTITLE 1,Cell 5
+def stream_pages_as_dataframes(api_url, headers, payload_base, max_pages=None, sleep_between=SLEEP_BETWEEN_PAGES):
+    page = 0
+    pages_fetched = 0
+    seen_ids = set()
+
+    while True:
+        if max_pages is not None and pages_fetched >= max_pages:
+            break
+        payload = dict(payload_base)
+        payload['page'] = page
+        resp_json = post_with_retries(api_url, payload, headers)
+        data = resp_json.get('data', {}) if isinstance(resp_json, dict) else {}
+        rows = data.get('rows', []) if isinstance(data, dict) else []
+        if not rows:
+            break
+        df_page = page_to_dataframe(data)
+        # optional dedupe similar to above...
+        yield df_page
+        pages_fetched += 1
+        page += 1
+        has_more = data.get('hasMore', None)
+        if has_more is False:
+            break
+        if has_more is None and len(rows) < payload_base.get('pageSize', 100):
+            break
+        time.sleep(sleep_between)
+
+# Example consumption:
+for page_df in stream_pages_as_dataframes(API_URL, HEADERS, payload_base):
+    print("Got page with", len(page_df), "rows")
+    # process page_df here (e.g., save to file, transform, etc.)
+
+
+# COMMAND ----------
+
+client_id = snflk_client_id 
+client_secret = snflk_client_secret
+redirect_uri = 'https://localhost.com' 
+authorization_endpoint = 'https://tmobile.west-us-2.privatelink.snowflakecomputing.com/oauth/authorize' 
+token_endpoint = 'https://tmobile.west-us-2.privatelink.snowflakecomputing.com/oauth/token-request' 
+refresh_token=snflk_refresh_token
+
+# Generate Access Token 
+
+hdrs = {'Authorization': 'Basic {}'.format(base64.b64encode('{}:{}'.format(client_id, client_secret).encode()).decode()), 
+
+    'Content-type': 'application/x-www-form-urlencoded;charset=utf-8'} 
+
+ 
+
+data = urlencode({ 
+
+        'grant_type': 'refresh_token', 
+
+        'refresh_token': refresh_token, 
+
+        'redirect_uri': redirect_uri 
+
+    }) 
+
+data = data.encode('ascii') 
+
+ 
+
+r = requests.post( 
+
+    token_endpoint, 
+
+    headers=hdrs, 
+
+    data=data) 
+
+ 
+
+ 
+
+access_token = r.json()['access_token'] 
+
+#print('access token: ' + access_token) 
+
+ 
+
+snflk_conn = snowflake.connector.connect( 
+
+    user="RSC_PRD_SF_PBOARD_DI@T-MOBILE.COM", 
+
+    account='tmobile.west-us-2.privatelink', 
+
+    authenticator='oauth', 
+
+    warehouse='BDM_PPDA_DI_PRD_WH_01', 
+
+    database='BDM_PPDA_DB', 
+
+    schema = 'PROD_BOARD_T', 
+
+    token=access_token 
+
+)    
+
+cur = snflk_conn.cursor() 
+
+
+
+#cur.close() 
+
+#ctx.close() 
+ 
+
+
+# COMMAND ----------
+
+display(df_all)
+
+# COMMAND ----------
+
+
+write_pandas(
+    snflk_conn,
+    df_all,
+    "TSENTIMENT_SPRINKLR_RAW",
+    auto_create_table=True
+)
